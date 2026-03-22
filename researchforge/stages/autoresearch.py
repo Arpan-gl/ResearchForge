@@ -42,6 +42,7 @@ class Autoresearch:
         self.settings = Settings()
         self.ollama_url = self.settings.ollama_url
         self.model = self.settings.llm_model
+        self.kernel_name = "python3"
 
     # ── Main entry point ──────────────────────────────────────────
 
@@ -55,6 +56,8 @@ class Autoresearch:
         Display.info(f"Starting autonomous experiment loop  budget={budget}")
         Display.info(f"Metric: {metric} · Seeds: {self.SEEDS} · Timeout: {experiment_timeout}s/seed")
         Display.info("Stop early: Ctrl+C — best result will be saved\n")
+
+        self._preflight_checks(notebook_path)
 
         # Set up git branch (Karpathy pattern)
         branch_tag = self._setup_git_branch(notebook_path)
@@ -165,6 +168,68 @@ class Autoresearch:
             "fallback_used":    fallback_used,
         }
 
+    def _preflight_checks(self, notebook_path: str):
+        """Fail fast on missing runtime prerequisites before long experiment loops."""
+        Display.info("Running Stage 4 preflight checks…")
+
+        nb_path = os.path.abspath(notebook_path)
+        if not os.path.exists(nb_path):
+            raise RuntimeError(f"Notebook not found: {nb_path}")
+
+        try:
+            with open(nb_path, encoding="utf-8") as f:
+                nbformat.read(f, as_version=4)
+        except Exception as e:
+            raise RuntimeError(f"Notebook is not readable/valid: {e}")
+
+        jupyter_bin = shutil.which("jupyter")
+        if not jupyter_bin:
+            raise RuntimeError("Jupyter executable not found in PATH")
+
+        try:
+            subprocess.run(
+                ["jupyter", "nbconvert", "--version"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=True,
+            )
+        except Exception as e:
+            raise RuntimeError(f"nbconvert unavailable: {e}")
+
+        try:
+            ks_result = subprocess.run(
+                ["jupyter", "kernelspec", "list", "--json"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=True,
+            )
+            kernelspecs = json.loads(ks_result.stdout or "{}").get("kernelspecs", {})
+            selected = self._resolve_kernel_name(kernelspecs)
+            if not selected:
+                raise RuntimeError("No installed Jupyter kernels were found")
+            self.kernel_name = selected
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Could not resolve Jupyter kernel: {e}")
+
+        Display.success(f"Preflight OK · Kernel: {self.kernel_name} · Notebook: {os.path.basename(nb_path)}")
+
+    def _resolve_kernel_name(self, kernelspecs: dict) -> str | None:
+        if not kernelspecs:
+            return None
+
+        if "python3" in kernelspecs:
+            return "python3"
+
+        python_like = [name for name in kernelspecs.keys() if name.lower().startswith("python")]
+        if python_like:
+            return sorted(python_like)[0]
+
+        return sorted(kernelspecs.keys())[0]
+
     # ── Git helpers (Karpathy pattern) ────────────────────────────
 
     def _setup_git_branch(self, notebook_path: str) -> str:
@@ -249,13 +314,16 @@ class Autoresearch:
                 Display.warn(f"Baseline timed out after {timeout}s — using estimate 0.70")
                 return 0.70
             if return_code != 0:
-                snippet = self._extract_error_snippet(output)
+                log_path = self._write_execution_log("baseline", output)
+                snippet = self._extract_error_snippet(output, max_lines=25)
                 if snippet:
                     Display.warn(
-                        f"Baseline execution failed (exit={return_code}). First error:\n{snippet}\nUsing estimate 0.70"
+                        f"Baseline execution failed (exit={return_code}).\n{snippet}\nFull log: {log_path}\nUsing estimate 0.70"
                     )
                 else:
-                    Display.warn(f"Baseline execution failed (exit={return_code}) — using estimate 0.70")
+                    Display.warn(
+                        f"Baseline execution failed (exit={return_code}) — full log: {log_path} — using estimate 0.70"
+                    )
                 return 0.70
 
             score = self._parse_metric_from_output(output, metric)
@@ -322,11 +390,14 @@ class Autoresearch:
                         Display.warn(f"  Seed {seed}: timed out after {timeout}s — skipped")
                         continue
                     if return_code != 0:
-                        snippet = self._extract_error_snippet(all_output)
+                        log_path = self._write_execution_log(f"seed_{seed}", all_output)
+                        snippet = self._extract_error_snippet(all_output, max_lines=25)
                         if snippet:
-                            Display.warn(f"  Seed {seed}: execution failed (exit={return_code})\n{snippet}")
+                            Display.warn(
+                                f"  Seed {seed}: execution failed (exit={return_code})\n{snippet}\nFull log: {log_path}"
+                            )
                         else:
-                            Display.warn(f"  Seed {seed}: execution failed (exit={return_code})")
+                            Display.warn(f"  Seed {seed}: execution failed (exit={return_code}) — full log: {log_path}")
                         continue
 
                     # 6. Parse metric from stdout/stderr then from executed notebook
@@ -366,7 +437,7 @@ class Autoresearch:
             "jupyter", "nbconvert", "--to", "notebook",
             "--execute", "--output", output_path,
             "--ExecutePreprocessor.timeout", str(timeout),
-            "--ExecutePreprocessor.kernel_name", "python3",
+            "--ExecutePreprocessor.kernel_name", self.kernel_name,
             notebook_path,
         ]
 
@@ -381,9 +452,25 @@ class Autoresearch:
             popen_kwargs["start_new_session"] = True
 
         proc = subprocess.Popen(cmd, **popen_kwargs)
+        start_ts = time.time()
+        heartbeat_every = 30
+        hard_timeout = timeout + 60
         try:
-            stdout, stderr = proc.communicate(timeout=timeout + 60)
-            return stdout + stderr, proc.returncode, False
+            while True:
+                elapsed = int(time.time() - start_ts)
+                remaining = hard_timeout - elapsed
+                if remaining <= 0:
+                    self._terminate_process(proc)
+                    return "", -1, True
+
+                wait_for = min(heartbeat_every, remaining)
+                try:
+                    stdout, stderr = proc.communicate(timeout=wait_for)
+                    return (stdout or "") + (stderr or ""), proc.returncode, False
+                except subprocess.TimeoutExpired:
+                    Display.info(
+                        f"Notebook still running ({elapsed}s elapsed / {hard_timeout}s max): {os.path.basename(notebook_path)}"
+                    )
         except subprocess.TimeoutExpired as e:
             self._terminate_process(proc)
             timed_out_output = (e.stdout or "") + (e.stderr or "")
@@ -602,7 +689,7 @@ class Autoresearch:
         ]
         return suggestions[index % len(suggestions)]
 
-    def _extract_error_snippet(self, output: str) -> str:
+    def _extract_error_snippet(self, output: str, max_lines: int = 20) -> str:
         text = (output or "").strip()
         if not text:
             return ""
@@ -615,17 +702,33 @@ class Autoresearch:
                 break
 
         if traceback_idx is not None:
-            snippet = lines[traceback_idx:traceback_idx + 8]
+            snippet = lines[traceback_idx:traceback_idx + max_lines]
             return "\n".join(snippet)
 
         error_lines = [
             line for line in lines
-            if any(token in line for token in ["Error", "Exception", "FileNotFound", "ValueError", "KeyError"])
+            if any(
+                token in line
+                for token in [
+                    "Error", "Exception", "FileNotFound", "ValueError", "KeyError",
+                    "ImportError", "ModuleNotFoundError", "AttributeError", "TypeError", "RuntimeError",
+                ]
+            )
         ]
         if error_lines:
-            return "\n".join(error_lines[:4])
+            return "\n".join(error_lines[:8])
 
-        return "\n".join(lines[-6:])
+        return "\n".join(lines[-12:])
+
+    def _write_execution_log(self, tag: str, output: str) -> str:
+        safe_tag = "".join(c if c.isalnum() or c in {"_", "-"} else "_" for c in tag)
+        path = os.path.join(tempfile.gettempdir(), f"rf_nbexec_{safe_tag}_{int(time.time())}.log")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(output or "")
+            return path
+        except Exception:
+            return "(failed to write log)"
 
     # ── Metric parsing ────────────────────────────────────────────
 

@@ -67,8 +67,12 @@ def main():
         help="Export report after pipeline: html | pdf",
     )
     run_parser.add_argument(
-        "--budget", type=int, default=100,
-        help="Autoresearch experiment budget (default: 100)",
+        "--budget", type=int, default=10,
+        help="Autoresearch experiment budget (default: 10)",
+    )
+    run_parser.add_argument(
+        "--experiment-timeout", type=int, default=300,
+        help="Per-seed notebook execution timeout in seconds (default: 300)",
     )
 
     # ── researchforge chat ────────────────────────────────────────
@@ -100,6 +104,7 @@ def main():
             model_override=args.model,
             export=args.export,
             budget=args.budget,
+            experiment_timeout=args.experiment_timeout,
         )
 
     elif args.command == "chat":

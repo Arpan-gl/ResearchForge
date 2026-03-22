@@ -29,6 +29,7 @@ class Pipeline:
         model_override: str = None,
         export: str = None,
         budget: int = 100,
+        experiment_timeout: int = 300,
     ):
         Display.banner()
         Display.section("Starting ResearchForge Pipeline")
@@ -103,11 +104,14 @@ class Pipeline:
             if not skip_training:
                 stage_name = "Autoresearch"
                 Display.stage(4, "Autoresearch — running experiments on your GPU")
-                Display.info("This runs until budget is exhausted.  Ctrl+C to stop early.\n")
+                Display.info(
+                    f"This runs until budget is exhausted (budget={budget}, timeout/seed={experiment_timeout}s).  Ctrl+C to stop early.\n"
+                )
                 auto_result = self.auto.run(
                     notebook_path=v3_result["notebook_path"],
                     metric=v3_result["metric_name"],
                     budget=budget,
+                    experiment_timeout=experiment_timeout,
                 )
                 results["autoresearch"] = auto_result
                 Display.success(

@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import pytest
+import nbformat
 from unittest.mock import patch, MagicMock
 
 
@@ -244,11 +245,34 @@ def test_v3_data_loading_cell_uses_candidates_and_target_fallback():
 
             assert "DATASET_CANDIDATES" in load_cell
             assert "RF_DATASET_PATH" in load_cell
+            assert "_maybe_download_kaggle_dataset" in load_cell
             assert "TARGET_COL" in load_cell
             assert "X = df.drop(columns=[TARGET_COL])" in preprocess_cell
             assert result["dataset_candidates"][0] == "custom/path/data.csv"
         finally:
             os.chdir(original_dir)
+
+
+def test_autoresearch_extract_error_snippet_keeps_deeper_traceback_context():
+    from researchforge.stages.autoresearch import Autoresearch
+
+    auto = Autoresearch.__new__(Autoresearch)
+    long_trace = "\n".join([
+        "Traceback (most recent call last):",
+        "  File 'launcher.py', line 1, in <module>",
+        "    main()",
+        "  File 'app.py', line 10, in main",
+        "    run()",
+        "  File 'runner.py', line 50, in run",
+        "    step()",
+        "  File 'step.py', line 99, in step",
+        "    load_data()",
+        "  File 'data.py', line 5, in load_data",
+        "    raise FileNotFoundError('missing data file')",
+        "FileNotFoundError: missing data file",
+    ])
+    snippet = auto._extract_error_snippet(long_trace, max_lines=25)
+    assert "FileNotFoundError: missing data file" in snippet
 
 
 def test_autoresearch_parse_suggestion_response_strict_json_and_errors():
@@ -297,3 +321,30 @@ def test_autoresearch_uses_fallback_for_reserved_budget_and_parse_failures():
     assert source == "fallback"
     assert reason == "empty_response"
     assert suggestion["target_section"] in {"model", "training", "preprocessing", "features"}
+
+
+def test_autoresearch_resolve_kernel_name_prefers_python3():
+    from researchforge.stages.autoresearch import Autoresearch
+
+    auto = Autoresearch.__new__(Autoresearch)
+    kernelspecs = {
+        "python3": {"resource_dir": "x", "spec": {"display_name": "Python 3"}},
+        "ir": {"resource_dir": "y", "spec": {"display_name": "R"}},
+    }
+    assert auto._resolve_kernel_name(kernelspecs) == "python3"
+
+
+def test_autoresearch_preflight_fails_when_jupyter_missing():
+    from researchforge.stages.autoresearch import Autoresearch
+
+    with tempfile.TemporaryDirectory() as tmp:
+        nb = nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell("print('ok')")])
+        nb_path = os.path.join(tmp, "test.ipynb")
+        with open(nb_path, "w", encoding="utf-8") as f:
+            nbformat.write(nb, f)
+
+        auto = Autoresearch.__new__(Autoresearch)
+        auto.kernel_name = "python3"
+        with patch("researchforge.stages.autoresearch.shutil.which", return_value=None):
+            with pytest.raises(RuntimeError, match="Jupyter executable not found"):
+                auto._preflight_checks(nb_path)

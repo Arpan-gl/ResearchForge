@@ -133,10 +133,33 @@ class V3Notebook:
 
 import pandas as pd
 import os
+import tempfile
+import glob
 from pathlib import Path
 
 DATASET_CANDIDATES = {candidates_literal}
 REQUESTED_LABEL = {requested_label}
+
+
+def _maybe_download_kaggle_dataset(dataset_ref: str):
+    # Try to download a Kaggle dataset ref and return first CSV/Parquet path.
+    try:
+        import kaggle
+    except Exception:
+        return None
+
+    try:
+        tmp_dir = tempfile.mkdtemp(prefix="rf_kaggle_nb_")
+        kaggle.api.dataset_download_files(dataset_ref, path=tmp_dir, unzip=True)
+        csv_files = glob.glob(os.path.join(tmp_dir, "**", "*.csv"), recursive=True)
+        parquet_files = glob.glob(os.path.join(tmp_dir, "**", "*.parquet"), recursive=True)
+        all_files = csv_files + parquet_files
+        if all_files:
+            print(f"Downloaded Kaggle dataset '{{dataset_ref}}' to '{{tmp_dir}}'")
+            return all_files[0]
+    except Exception as e:
+        print(f"Kaggle download failed for '{{dataset_ref}}': {{e}}")
+    return None
 
 candidate_paths = []
 for raw in DATASET_CANDIDATES:
@@ -170,6 +193,16 @@ if DATASET_PATH is None:
     if len(inferred) == 1:
         DATASET_PATH = inferred[0]
         print(f"Using inferred dataset path: {{DATASET_PATH}}")
+
+# As a final fallback, try treating candidates like Kaggle dataset refs: owner/dataset
+if DATASET_PATH is None:
+    for raw in DATASET_CANDIDATES:
+        raw = (raw or "").strip()
+        if "/" in raw and not raw.lower().endswith((".csv", ".parquet")):
+            downloaded = _maybe_download_kaggle_dataset(raw)
+            if downloaded and os.path.exists(downloaded):
+                DATASET_PATH = downloaded
+                break
 
 if DATASET_PATH is None:
     attempted = "\\n".join(f"- {{p}}" for p in ordered_candidates[:10])
