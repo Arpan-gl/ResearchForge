@@ -1,18 +1,15 @@
 """
 V3 Notebook Generation
 -----------------------
-- Infers problem type from V1 + V2
-- Selects model based on dataset size and problem type
-- Generates a complete runnable .ipynb via Ollama LLM
-- 6 sections: Title → Load+EDA → Split → Preprocess → Model → Train+CV → Summary
+- Infers problem type from V1 + V2.
+- Selects model based on task type and dataset size.
+- Generates a runnable notebook with separated data/EDA/train/eval sections.
 """
 
 import json
-import os
 import nbformat
 from nbformat.v4 import new_notebook, new_markdown_cell, new_code_cell
 from researchforge.config.settings import Settings
-import requests
 
 
 class V3Notebook:
@@ -30,212 +27,257 @@ class V3Notebook:
             v2_dataset.get("problem_type")
             or v1_findings.get("problem_type", "classification")
         )
-        dataset_name = v2_dataset.get("name", "dataset")
-        label_col    = v2_dataset.get("label_column", "target")
-        risks        = v2_dataset.get("risks", [])
+        dataset_name = (
+            v2_dataset.get("path")
+            or v2_dataset.get("local_path")
+            or v2_dataset.get("name", "dataset.csv")
+        )
+        label_col = v2_dataset.get("label_column", "target")
+        dataset_candidates = self._build_dataset_candidates(v2_dataset, dataset_name)
 
-        model_name = model_override or self._select_model(problem_type, v2_dataset)
+        model_name, model_reason = self._select_model(problem_type, v2_dataset, model_override)
         metric_name, expected_range = self._expected_metrics(problem_type, model_name)
 
-        # Build cells
         nb = new_notebook()
         nb.cells = [
-            self._title_cell(topic, model_name, metric_name, expected_range),
-            self._cell_1_load_eda(dataset_name, label_col, problem_type),
-            self._cell_2_split(problem_type, label_col, risks),
-            self._cell_3_preprocess(problem_type, risks),
-            self._cell_4_model(problem_type, model_name, label_col),
-            self._cell_5_train(metric_name),
-            self._cell_6_summary(topic, model_name, metric_name, expected_range, v1_findings),
+            self._title_cell(topic, model_name, model_reason),
+            self._data_loading_cell(dataset_candidates, label_col),
+            self._eda_cell(),
+            self._preprocessing_cell(),
+            self._model_cell(problem_type, model_name),
+            self._training_cell(problem_type),
+            self._evaluation_cell(problem_type, metric_name),
+            self._summary_cell(topic, model_name, model_reason, v1_findings),
         ]
 
-        # Save
-        safe_topic = "".join(c if c.isalnum() else "_" for c in topic)[:40]
-        nb_path = f"researchforge_{safe_topic}.ipynb"
+        safe_topic = "".join(c if c.isalnum() else "_" for c in topic)[:30]
+        nb_path = f"rf_{safe_topic}.ipynb"
         with open(nb_path, "w", encoding="utf-8") as f:
             nbformat.write(nb, f)
 
         return {
             "notebook_path": nb_path,
-            "model":         model_name,
-            "metric_name":   metric_name,
+            "model": model_name,
+            "model_reason": model_reason,
+            "metric_name": metric_name,
             "expected_range": expected_range,
-            "problem_type":  problem_type,
+            "problem_type": problem_type,
+            "dataset_candidates": dataset_candidates,
+            "label_column_requested": label_col,
         }
 
-    # ── Model selection ───────────────────────────────────────────
+    def _build_dataset_candidates(self, v2_dataset: dict, dataset_name: str) -> list[str]:
+        candidates = []
+        for key in ["path", "local_path", "download_path", "name", "title"]:
+            value = (v2_dataset.get(key) or "").strip()
+            if value:
+                candidates.append(value)
+        if dataset_name:
+            candidates.append(dataset_name)
+        # Preserve order while deduplicating.
+        return list(dict.fromkeys(candidates))
 
-    def _select_model(self, problem_type: str, v2_dataset: dict) -> str:
+    def _select_model(self, problem_type: str, v2_dataset: dict, model_override: str = None) -> tuple[str, str]:
+        override = (model_override or "").strip().lower()
+        if override in {"gnn", "gatconv"}:
+            return "GATConv", "User override selected graph model"
+        if override in {"bert", "distilbert"}:
+            return "DistilBERT", "User override selected NLP transformer"
+        if override in {"xgboost", "xgb"}:
+            return "XGBoost", "User override selected gradient boosting baseline"
+        if override in {"lightgbm", "lgbm"}:
+            return "LightGBM", "User override selected efficient tabular booster"
+
+        rows = self._parse_rows(v2_dataset.get("shape", ""))
+
         if problem_type == "graph":
-            return "GATConv"
+            return "GATConv", "Graph task detected from research/dataset signals"
         if problem_type == "nlp":
-            return "DistilBERT"
-
-        shape = v2_dataset.get("shape", "")
-        try:
-            rows = int(shape.split("rows")[0].replace(",", "").strip())
-        except Exception:
-            rows = 10_000
+            return "DistilBERT", "Pretrained transformer for text-heavy tasks"
+        if problem_type == "regression":
+            return "LightGBMRegressor", "Good default for tabular regression"
 
         if rows < 10_000:
-            return "XGBoost"
-        if rows < 100_000:
-            return "LightGBM"
-        return "PyTorch MLP + LightGBM ensemble"
+            return "XGBoost", "Small dataset: robust baseline with strong bias/variance tradeoff"
+        return "LightGBM", "Efficient for medium-to-large structured datasets"
+
+    def _parse_rows(self, shape_str: str) -> int:
+        try:
+            return int(shape_str.split("rows")[0].replace(",", "").strip())
+        except Exception:
+            return 10_000
 
     def _expected_metrics(self, problem_type: str, model: str):
         defaults = {
-            "classification": ("F1-macro",  "0.78–0.86"),
-            "regression":     ("RMSE",       "model-dependent"),
-            "graph":          ("F1-macro",  "0.71–0.82"),
-            "nlp":            ("Accuracy",  "0.82–0.90"),
+            "classification": ("F1-macro", "0.78-0.86"),
+            "regression": ("RMSE", "model-dependent"),
+            "graph": ("F1-macro", "0.71-0.82"),
+            "nlp": ("Accuracy", "0.82-0.90"),
         }
-        return defaults.get(problem_type, ("F1-macro", "0.75–0.85"))
+        return defaults.get(problem_type, ("F1-macro", "0.75-0.85"))
 
-    # ── Notebook cells ────────────────────────────────────────────
-
-    def _title_cell(self, topic, model, metric, expected):
+    def _title_cell(self, topic, model, reason):
         return new_markdown_cell(
-            f"# ResearchForge — Generated Notebook\n"
-            f"**Topic**: {topic}  \n"
-            f"**Model**: `{model}`  \n"
-            f"**Expected {metric}**: `{expected}`  \n\n"
-            f"> Auto-generated by ResearchForge. "
-            f"Review each section before running on GPU.\n"
+            f"# AI Generated ML Notebook\n\n"
+            f"**Topic:** {topic}  \n"
+            f"**Model:** {model}  \n"
+            f"**Why this model:** {reason}  \n\n"
+            "This notebook is auto-generated. Review before running.\n"
         )
 
-    def _cell_1_load_eda(self, dataset_name, label_col, problem_type):
-        code = f"""\
-# ── SECTION 1: Load + EDA ──────────────────────────────────────
+    def _data_loading_cell(self, dataset_candidates, label_col):
+        candidates_literal = json.dumps(dataset_candidates)
+        requested_label = json.dumps(label_col)
+        return new_code_cell(f"""\
+# Load Data
+
 import pandas as pd
-import numpy as np
+import os
+from pathlib import Path
+
+DATASET_CANDIDATES = {candidates_literal}
+REQUESTED_LABEL = {requested_label}
+
+candidate_paths = []
+for raw in DATASET_CANDIDATES:
+    raw = (raw or "").strip()
+    if not raw:
+        continue
+    candidate_paths.append(raw)
+    candidate_paths.append(str(Path.cwd() / raw))
+
+env_dataset = os.getenv("RF_DATASET_PATH", "").strip()
+if env_dataset:
+    candidate_paths.insert(0, env_dataset)
+
+seen = set()
+ordered_candidates = []
+for path in candidate_paths:
+    if path and path not in seen:
+        ordered_candidates.append(path)
+        seen.add(path)
+
+DATASET_PATH = None
+for candidate in ordered_candidates:
+    if os.path.exists(candidate):
+        DATASET_PATH = candidate
+        break
+
+if DATASET_PATH is None:
+    csv_candidates = sorted(str(p) for p in Path.cwd().glob("*.csv"))
+    parquet_candidates = sorted(str(p) for p in Path.cwd().glob("*.parquet"))
+    inferred = csv_candidates + parquet_candidates
+    if len(inferred) == 1:
+        DATASET_PATH = inferred[0]
+        print(f"Using inferred dataset path: {{DATASET_PATH}}")
+
+if DATASET_PATH is None:
+    attempted = "\\n".join(f"- {{p}}" for p in ordered_candidates[:10])
+    raise FileNotFoundError(
+        "Could not locate a dataset file. Tried candidate paths:\\n"
+        + (attempted or "- (no candidates provided)")
+        + "\\nSet RF_DATASET_PATH or edit DATASET_CANDIDATES."
+    )
+
+if DATASET_PATH.lower().endswith(".parquet"):
+    df = pd.read_parquet(DATASET_PATH)
+else:
+    df = pd.read_csv(DATASET_PATH)
+
+target_hints = [
+    "target", "label", "class", "y", "output", "result", "outcome", "made", "shot"
+]
+
+if REQUESTED_LABEL in df.columns:
+    TARGET_COL = REQUESTED_LABEL
+else:
+    hinted_cols = [c for c in df.columns if any(h in c.lower() for h in target_hints)]
+    if hinted_cols:
+        TARGET_COL = hinted_cols[0]
+    else:
+        TARGET_COL = df.columns[-1]
+    print(f"Requested label '{{REQUESTED_LABEL}}' not found. Using '{{TARGET_COL}}' instead.")
+
+print(f"Dataset path: {{DATASET_PATH}}")
+print(f"Target column: {{TARGET_COL}}")
+print(df.shape)
+df.head()
+""")
+
+    def _eda_cell(self):
+        return new_code_cell(f"""\
+# Basic EDA
+
 import matplotlib.pyplot as plt
-import seaborn as sns
 
-# ⚠ Replace with your actual dataset path:
-DATASET_PATH = "{dataset_name}"
-
-df = pd.read_csv(DATASET_PATH)
-print(f"Shape: {{df.shape}}")
-print(df.head())
-print("\\nMissing values:")
+print(\"Missing values:\")
 print(df.isnull().sum())
-print(f"\\nDuplicate rows: {{df.duplicated().sum()}}")
 
-# Target distribution
-fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-df["{label_col}"].value_counts().plot(kind="bar", ax=axes[0], title="Target distribution")
+print(\"\\nDuplicates:\", df.duplicated().sum())
 
-# Correlation heatmap (numeric columns)
-numeric_df = df.select_dtypes(include=[np.number])
-if len(numeric_df.columns) > 1:
-    sns.heatmap(numeric_df.corr(), ax=axes[1], cmap="coolwarm", annot=False)
-    axes[1].set_title("Correlation heatmap")
+if TARGET_COL in df.columns:
+    df[TARGET_COL].value_counts().plot(kind=\"bar\")
+    plt.title(\"Target Distribution\")
+    plt.show()
+""")
 
-plt.tight_layout()
-plt.savefig("eda_overview.png", dpi=120)
-plt.show()
-print("EDA complete. Saved: eda_overview.png")
-"""
-        return new_code_cell(code)
+    def _preprocessing_cell(self):
+        return new_code_cell(f"""\
+# Preprocessing
 
-    def _cell_2_split(self, problem_type, label_col, risks):
-        smote_comment = (
-            "# NOTE: SMOTE is applied in Section 3 — class imbalance detected"
-            if any("imbalance" in r for r in risks)
-            else ""
-        )
-        code = f"""\
-# ── SECTION 2: Split ──────────────────────────────────────────
-from sklearn.model_selection import train_test_split, StratifiedKFold
-
-X = df.drop(columns=["{label_col}"])
-y = df["{label_col}"]
-
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, stratify=y, random_state=42
-)
-
-print(f"Train: {{X_train.shape}}, Test: {{X_test.shape}}")
-print(f"Class balance (train): {{y_train.value_counts().to_dict()}}")
-
-# 5-fold stratified cross-validation
-cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-{smote_comment}
-"""
-        return new_code_cell(code)
-
-    def _cell_3_preprocess(self, problem_type, risks):
-        smote_code = ""
-        if any("imbalance" in r for r in risks):
-            smote_code = """\
-
-# Apply SMOTE on training data only (imbalance detected by V2 audit)
-from imblearn.over_sampling import SMOTE
-smote = SMOTE(random_state=42)
-X_train_num = X_train.select_dtypes(include=[np.number]).fillna(0)
-X_train, y_train = smote.fit_resample(X_train_num, y_train)
-print(f"After SMOTE: {{X_train.shape}}")
-"""
-
-        code = f"""\
-# ── SECTION 3: Preprocess ────────────────────────────────────
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
 from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
 import numpy as np
 
-# Encode categoricals
-cat_cols = X_train.select_dtypes(include=["object"]).columns.tolist()
-le_encoders = {{}}
-for col in cat_cols:
-    le = LabelEncoder()
-    X_train[col] = le.fit_transform(X_train[col].astype(str))
-    X_test[col]  = le.transform(X_test[col].astype(str))
-    le_encoders[col] = le
+# Drop likely ID columns
+df = df[[col for col in df.columns if \"id\" not in col.lower()]]
 
-# Impute + scale numeric
-num_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
-imputer = SimpleImputer(strategy="median")
-scaler  = StandardScaler()
+X = df.drop(columns=[TARGET_COL])
+y = df[TARGET_COL]
 
-X_train[num_cols] = scaler.fit_transform(imputer.fit_transform(X_train[num_cols]))
-X_test[num_cols]  = scaler.transform(imputer.transform(X_test[num_cols]))
-{smote_code}
-print("Preprocessing complete.")
-"""
-        return new_code_cell(code)
+# Encode categorical features conservatively
+for col in X.select_dtypes(include=[\"object\"]).columns:
+    if X[col].nunique() < 50:
+        le = LabelEncoder()
+        X[col] = le.fit_transform(X[col].astype(str))
+    else:
+        X = X.drop(columns=[col])
 
-    def _cell_4_model(self, problem_type, model_name, label_col):
-        if problem_type == "graph":
-            code = self._gnn_model_cell(label_col)
-        elif problem_type == "nlp":
-            code = self._nlp_model_cell(label_col)
-        elif model_name == "XGBoost":
-            code = self._xgboost_cell()
-        elif "LightGBM" in model_name:
-            code = self._lightgbm_cell()
-        else:
-            # MLP ensemble fallback
-            code = self._mlp_ensemble_cell()
-        return new_code_cell(code)
+num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+if num_cols:
+    imputer = SimpleImputer(strategy=\"median\")
+    scaler = StandardScaler()
+    X[num_cols] = scaler.fit_transform(imputer.fit_transform(X[num_cols]))
 
-    def _gnn_model_cell(self, label_col):
-        return """\
-# ── SECTION 4: GNN Model (PyTorch Geometric) ─────────────────
+X = X.fillna(0)
+
+stratify_arg = y if y.nunique() < 20 else None
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=stratify_arg
+)
+""")
+
+    def _model_cell(self, problem_type, model_name):
+        if problem_type == "graph" or model_name == "GATConv":
+            return new_code_cell(f"""\
+# Graph Model (GATConv)
+
 import torch
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv
-from torch_geometric.data import Data, DataLoader
+from torch_geometric.data import DataLoader
+from researchforge.utils.graph_builder import GraphBuilder
 
-# Device — uses your GPU automatically
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")
+print(f\"Using device: {{device}}\")
 
 class ResearchForgeGNN(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, heads=4):
+    def __init__(self, in_channels, hidden_channels, out_channels):
         super().__init__()
-        self.conv1 = GATConv(in_channels, hidden_channels, heads=heads, dropout=0.3)
-        self.conv2 = GATConv(hidden_channels * heads, hidden_channels, heads=1)
+        self.conv1 = GATConv(in_channels, hidden_channels, heads=4, dropout=0.3)
+        self.conv2 = GATConv(hidden_channels * 4, hidden_channels, heads=1)
         self.classifier = torch.nn.Linear(hidden_channels, out_channels)
 
     def forward(self, data):
@@ -244,211 +286,107 @@ class ResearchForgeGNN(torch.nn.Module):
         x = F.elu(self.conv1(x, edge_index))
         x = F.dropout(x, p=0.3, training=self.training)
         x = self.conv2(x, edge_index)
-        return self.classifier(x[0])  # global node / shot target
+        return self.classifier(x[0])
 
-# Build graph dataset using ResearchForge GraphBuilder:
-from researchforge.utils.graph_builder import GraphBuilder
+POSITION_COLS = [\"x\", \"y\", \"velocity_x\", \"velocity_y\"]
+LABEL_COL = TARGET_COL
 
-POSITION_COLS    = ["x", "y", "velocity_x", "velocity_y"]  # ← update to your actual columns
-LABEL_COL        = \"""" + label_col + """\"""
-PROXIMITY_THRESH = 3.0  # meters
-
-builder    = GraphBuilder()
+builder = GraphBuilder()
 graph_list = builder.build_from_dataframe(
-    df, position_cols=POSITION_COLS,
+    df,
+    position_cols=POSITION_COLS,
     label_col=LABEL_COL,
-    proximity_threshold=PROXIMITY_THRESH,
+    proximity_threshold=3.0,
 )
-print(f"Built {len(graph_list)} graph samples")
-print(f"Sample: {graph_list[0]}")
 
 loader = DataLoader(graph_list, batch_size=32, shuffle=True)
-
 n_features = graph_list[0].x.shape[1]
-n_classes  = df[LABEL_COL].nunique()
+n_classes = df[LABEL_COL].nunique()
 model = ResearchForgeGNN(n_features, hidden_channels=64, out_channels=n_classes).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-print(f"GNN model: {sum(p.numel() for p in model.parameters()):,} parameters")
-"""
+""")
 
-    def _nlp_model_cell(self, label_col):
-        return f"""\
-# ── SECTION 4: NLP Model (DistilBERT fine-tune) ───────────────
+        if problem_type == "nlp" or model_name == "DistilBERT":
+            return new_code_cell(f"""\
+# NLP Model (DistilBERT)
+
 import torch
-from transformers import (
-    DistilBertTokenizerFast,
-    DistilBertForSequenceClassification,
-    Trainer, TrainingArguments,
-)
-from datasets import Dataset
+from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {{device}}")
+device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")
+print(f\"Using device: {{device}}\")
 
-# ⚠ Update TEXT_COL to the column containing your text
-TEXT_COL  = "text"
-LABEL_COL = "{label_col}"
+TEXT_COL = \"text\"
+LABEL_COL = TARGET_COL
 
-tokenizer = DistilBertTokenizerFast.from_pretrained("distilbert-base-uncased")
+if TEXT_COL not in df.columns:
+    raise ValueError(\"Expected a 'text' column for NLP notebooks\")
 
-def tokenize(batch):
-    return tokenizer(batch[TEXT_COL], truncation=True, padding=True, max_length=128)
-
-hf_dataset = Dataset.from_pandas(df[[TEXT_COL, LABEL_COL]])
-hf_dataset = hf_dataset.map(tokenize, batched=True)
-
+tokenizer = DistilBertTokenizerFast.from_pretrained(\"distilbert-base-uncased\")
 n_labels = df[LABEL_COL].nunique()
 model = DistilBertForSequenceClassification.from_pretrained(
-    "distilbert-base-uncased", num_labels=n_labels
+    \"distilbert-base-uncased\", num_labels=n_labels
 ).to(device)
+""")
 
-training_args = TrainingArguments(
-    output_dir="./rf_nlp_output",
-    num_train_epochs=3,
-    per_device_train_batch_size=16,
-    evaluation_strategy="epoch",
-    save_strategy="epoch",
-    load_best_model_at_end=True,
-    fp16=torch.cuda.is_available(),
-)
-print("DistilBERT model ready.")
-"""
+        if problem_type == "regression" or model_name == "LightGBMRegressor":
+            return new_code_cell("""\
+from lightgbm import LGBMRegressor
+model = LGBMRegressor()
+""")
 
-    def _xgboost_cell(self):
-        return """\
-# ── SECTION 4: XGBoost Model ──────────────────────────────────
+        if model_name == "XGBoost":
+            return new_code_cell("""\
 import xgboost as xgb
-from sklearn.metrics import f1_score, classification_report
-import torch
+model = xgb.XGBClassifier()
+""")
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-
-# XGBoost uses CUDA automatically when device="cuda"
-model = xgb.XGBClassifier(
-    n_estimators=500,
-    learning_rate=0.05,
-    max_depth=6,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    eval_metric="mlogloss",
-    device="cuda" if torch.cuda.is_available() else "cpu",
-    random_state=42,
-)
-print("XGBoost model ready.")
-"""
-
-    def _lightgbm_cell(self):
-        return """\
-# ── SECTION 4: LightGBM Model ─────────────────────────────────
+        if model_name == "LightGBM":
+            return new_code_cell("""\
 import lightgbm as lgb
-from sklearn.metrics import f1_score
-import torch
+model = lgb.LGBMClassifier()
+""")
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+        return new_code_cell("""\
+from sklearn.ensemble import RandomForestClassifier
+model = RandomForestClassifier()
+""")
 
-model = lgb.LGBMClassifier(
-    n_estimators=500,
-    learning_rate=0.05,
-    num_leaves=63,
-    device="gpu" if torch.cuda.is_available() else "cpu",
-    random_state=42,
-    n_jobs=-1,
-)
-print("LightGBM model ready.")
-"""
+    def _training_cell(self, problem_type):
+        return new_code_cell("""\
+# Training
 
-    def _mlp_ensemble_cell(self):
-        return """\
-# ── SECTION 4: PyTorch MLP + LightGBM Ensemble ────────────────
-import torch
-import torch.nn as nn
-import lightgbm as lgb
-from sklearn.metrics import f1_score
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-
-# PyTorch MLP
-class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, output_dim),
-        )
-    def forward(self, x): return self.net(x)
-
-n_features = X_train.shape[1]
-n_classes  = len(set(y_train))
-mlp_model  = MLP(n_features, 256, n_classes).to(device)
-optimizer  = torch.optim.AdamW(mlp_model.parameters(), lr=1e-3, weight_decay=1e-4)
-
-# LightGBM for ensemble
-lgb_model = lgb.LGBMClassifier(
-    n_estimators=500, learning_rate=0.05, num_leaves=63,
-    device="gpu" if torch.cuda.is_available() else "cpu",
-    random_state=42, n_jobs=-1,
-)
-print("MLP + LightGBM ensemble ready.")
-"""
-
-    def _cell_5_train(self, metric_name):
-        code = f"""\
-# ── SECTION 5: Train + 5-fold CV ──────────────────────────────
-from sklearn.model_selection import cross_val_score
-from sklearn.metrics import f1_score, classification_report
-import numpy as np
-
-# 5-fold cross-validation
-scores = cross_val_score(
-    model, X_train, y_train,
-    cv=cv, scoring="f1_macro", n_jobs=-1,
-)
-print(f"CV {metric_name}: {{scores.mean():.3f}} ± {{scores.std():.3f}}")
-
-# Final fit on full training set
 model.fit(X_train, y_train)
+""")
 
-# Holdout evaluation
-y_pred     = model.predict(X_test)
-final_score = f1_score(y_test, y_pred, average="macro")
-print(f"\\nHoldout {metric_name}: {{final_score:.3f}}")
-print("\\nClassification Report:")
-print(classification_report(y_test, y_pred))
-"""
-        return new_code_cell(code)
+    def _evaluation_cell(self, problem_type, metric_name):
+        if problem_type == "regression":
+            return new_code_cell("""\
+from sklearn.metrics import mean_squared_error
 
-    def _cell_6_summary(self, topic, model, metric, expected, v1_findings):
-        key_findings_json = json.dumps(v1_findings.get("key_findings", [])[:3])
-        limitations_json  = json.dumps(v1_findings.get("limitations", [])[:2])
-        code = f"""\
-# ── SECTION 6: Business Summary ───────────────────────────────
-import json, joblib
+preds = model.predict(X_test)
+print("RMSE:", mean_squared_error(y_test, preds, squared=False))
+""")
+
+        return new_code_cell(f"""\
+from sklearn.metrics import classification_report, f1_score
+
+preds = model.predict(X_test)
+print(classification_report(y_test, preds))
+print("{metric_name}:", f1_score(y_test, preds, average=\"macro\"))
+""")
+
+    def _summary_cell(self, topic, model, reason, v1_findings):
+        return new_code_cell(f"""\
+# Summary
+
+import json
 
 summary = {{
-    "topic":    "{topic}",
-    "model":    "{model}",
-    "metric":   "{metric}",
-    "expected_range": "{expected}",
-    "key_research_findings": {key_findings_json},
-    "dataset_risks": {limitations_json},
-    "next_steps": [
-        "Run: researchforge run \\"{topic}\\" (autoresearch overnight optimization)",
-        "Review EDA plots in eda_overview.png",
-        "Try --model gnn if using player-tracking / graph data",
-    ],
+    \"topic\": \"{topic}\",
+    \"model\": \"{model}\",
+    \"reason\": \"{reason}\",
+    \"research_insights\": {json.dumps(v1_findings.get("key_findings", [])[:3])}
 }}
-print(json.dumps(summary, indent=2))
 
-# Save model
-joblib.dump(model, "researchforge_model.pkl")
-print("\\nModel saved to researchforge_model.pkl")
-"""
-        return new_code_cell(code)
+print(json.dumps(summary, indent=2))
+""")

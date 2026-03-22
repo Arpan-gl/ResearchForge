@@ -92,3 +92,15 @@ def test_broken_config_falls_back_to_defaults():
                 reload(sm)
                 s = sm.Settings()
                 assert s.ollama_url == "http://localhost:11434"
+
+
+def test_cli_warning_filter_is_targeted():
+    from researchforge import cli
+
+    with patch("warnings.filterwarnings") as fw:
+        cli._configure_warning_filters()
+
+    fw.assert_called_once()
+    kwargs = fw.call_args.kwargs
+    assert kwargs["module"] == r"pydantic\._internal\._fields"
+    assert "protected namespace" in kwargs["message"]

@@ -98,7 +98,7 @@ def test_v3_creates_notebook_file():
 
 
 def test_v3_notebook_has_correct_structure():
-    """Generated notebook should have a title + 6 code sections."""
+    """Generated notebook should have a title + 7 code sections."""
     import nbformat
     from researchforge.stages.v3_notebook import V3Notebook
 
@@ -115,11 +115,11 @@ def test_v3_notebook_has_correct_structure():
             )
             with open(result["notebook_path"]) as f:
                 nb = nbformat.read(f, as_version=4)
-            # 1 markdown title + 6 code sections = 7 cells
-            assert len(nb.cells) == 7
+            # 1 markdown title + 7 code sections = 8 cells
+            assert len(nb.cells) == 8
             assert nb.cells[0].cell_type == "markdown"
             code_cells = [c for c in nb.cells if c.cell_type == "code"]
-            assert len(code_cells) == 6
+            assert len(code_cells) == 7
         finally:
             os.chdir(original_dir)
 
@@ -178,3 +178,122 @@ def test_load_state_returns_empty_dict_when_missing():
     with patch("researchforge.utils.state._STATE_PATH", Path("/nonexistent/path.json")):
         result = load_state()
     assert result == {}
+
+
+def test_pipeline_stops_early_when_no_dataset_found():
+    from researchforge.core.pipeline import Pipeline
+
+    pipeline = Pipeline.__new__(Pipeline)
+    pipeline.v1 = MagicMock()
+    pipeline.v2 = MagicMock()
+    pipeline.v3 = MagicMock()
+    pipeline.auto = MagicMock()
+    pipeline._print_summary = MagicMock()
+
+    pipeline.v1.run.return_value = MOCK_V1_RESULT
+    pipeline.v2.discover_and_score.return_value = {
+        "name": "No dataset found",
+        "score": 0.0,
+        "source": "none",
+        "risks": ["No matching public datasets — provide your own with --dataset"],
+    }
+
+    with patch("researchforge.core.pipeline.Display"):
+        with patch("researchforge.core.pipeline.save_state") as save_state:
+            result = pipeline.run("test topic", skip_training=False, budget=5)
+
+    assert result["status"] == "dataset_unavailable"
+    pipeline.v3.generate.assert_not_called()
+    pipeline.auto.run.assert_not_called()
+    save_state.assert_called_once()
+
+
+def test_cli_run_passes_budget_to_pipeline():
+    from researchforge import cli
+
+    fake_pipeline = MagicMock()
+    with patch("researchforge.core.pipeline.Pipeline", return_value=fake_pipeline):
+        with patch("sys.argv", ["researchforge", "run", "topic", "--budget", "7"]):
+            cli.main()
+
+    kwargs = fake_pipeline.run.call_args.kwargs
+    assert kwargs["budget"] == 7
+
+
+def test_v3_data_loading_cell_uses_candidates_and_target_fallback():
+    import nbformat
+    from researchforge.stages.v3_notebook import V3Notebook
+
+    with tempfile.TemporaryDirectory() as tmp:
+        original_dir = os.getcwd()
+        os.chdir(tmp)
+        try:
+            v3 = V3Notebook.__new__(V3Notebook)
+            v3.settings = MagicMock()
+            v2 = dict(MOCK_V2_RESULT)
+            v2["path"] = "custom/path/data.csv"
+            result = v3.generate(
+                topic="test topic",
+                v1_findings=MOCK_V1_RESULT,
+                v2_dataset=v2,
+            )
+            with open(result["notebook_path"], encoding="utf-8") as f:
+                nb = nbformat.read(f, as_version=4)
+            load_cell = [c for c in nb.cells if c.cell_type == "code"][0].source
+            preprocess_cell = [c for c in nb.cells if c.cell_type == "code"][2].source
+
+            assert "DATASET_CANDIDATES" in load_cell
+            assert "RF_DATASET_PATH" in load_cell
+            assert "TARGET_COL" in load_cell
+            assert "X = df.drop(columns=[TARGET_COL])" in preprocess_cell
+            assert result["dataset_candidates"][0] == "custom/path/data.csv"
+        finally:
+            os.chdir(original_dir)
+
+
+def test_autoresearch_parse_suggestion_response_strict_json_and_errors():
+    from researchforge.stages.autoresearch import Autoresearch
+
+    auto = Autoresearch.__new__(Autoresearch)
+    valid, reason = auto._parse_suggestion_response(
+        '{"description":"tune model","target_section":"training","code_change":"a → b","expected_gain":"2%"}'
+    )
+    assert reason == "ok"
+    assert valid["target_section"] == "training"
+
+    invalid, reason = auto._parse_suggestion_response("not json")
+    assert invalid is None
+    assert reason == "malformed_json"
+
+    missing, reason = auto._parse_suggestion_response('{"description":"x"}')
+    assert missing is None
+    assert reason.startswith("missing_keys:")
+
+
+def test_autoresearch_uses_fallback_for_reserved_budget_and_parse_failures():
+    from researchforge.stages.autoresearch import Autoresearch
+
+    auto = Autoresearch.__new__(Autoresearch)
+
+    suggestion, source, reason = auto._next_suggestion(
+        index=0,
+        fallback_budget=2,
+        history=[],
+        metric="F1-macro",
+        best_score=0.7,
+    )
+    assert source == "fallback"
+    assert reason == "ok"
+    assert "description" in suggestion
+
+    with patch.object(auto, "_suggest_modification", return_value=(None, "empty_response")):
+        suggestion, source, reason = auto._next_suggestion(
+            index=3,
+            fallback_budget=1,
+            history=[],
+            metric="F1-macro",
+            best_score=0.7,
+        )
+    assert source == "fallback"
+    assert reason == "empty_response"
+    assert suggestion["target_section"] in {"model", "training", "preprocessing", "features"}

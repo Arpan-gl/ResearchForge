@@ -2,8 +2,8 @@
 V1 Research Pipeline
 --------------------
 1. Rewrite topic into 4 query variants
-2. Search web (DuckDuckGo) + arXiv in parallel
-3. Rerank by recency + credibility + depth
+2. Search via Tavily in parallel
+3. Deduplicate + relevance filter + rerank
 4. Extract structured findings via Ollama LLM
 5. Flag numeric contradictions
 6. Flag semantic contradictions via Ollama pairwise comparison
@@ -11,193 +11,208 @@ V1 Research Pipeline
 
 import requests
 import json
-import time
+import os
+import re
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from researchforge.config.settings import Settings
 
 
 class V1Research:
-    def __init__(self):
+    def __init__(self, ollama_url: str = None, model: str = None, tavily_api_key: str = None):
         self.settings = Settings()
-        self.ollama_url = self.settings.ollama_url
-        self.model = self.settings.llm_model
+        self.ollama_url = ollama_url or self.settings.ollama_url
+        self.model = model or self.settings.llm_model
+        self.tavily_api_key = (
+            tavily_api_key
+            or os.environ.get("TAVILY_API_KEY")
+            or self.settings.tavily_api_key
+        )
 
     def run(self, topic: str) -> dict:
-        # Step 1: rewrite topic into 4 query variants
         queries = self._rewrite_queries(topic)
 
-        # Step 2: parallel search
+        # Step 2: parallel Tavily search
         with ThreadPoolExecutor(max_workers=4) as executor:
-            web_futures   = [executor.submit(self._web_search,   q) for q in queries[:2]]
-            arxiv_futures = [executor.submit(self._arxiv_search, q) for q in queries[2:]]
-            all_results = []
-            for f in web_futures + arxiv_futures:
-                all_results.extend(f.result())
+            futures = [executor.submit(self._tavily_search, q) for q in queries]
+            results = []
+            for f in futures:
+                results.extend(f.result())
 
-        # Step 3: deduplicate + rerank
-        ranked = self._rerank(all_results)
+        # Step 3: deduplicate + relevance filter + rerank
+        results = self._deduplicate(results)
+        results = self._filter_relevance(results, topic)
+        ranked = self._rerank(results)
+        top_sources = ranked[:10]
 
-        # Step 4: extract findings via LLM
-        findings = self._extract_findings(topic, ranked)
-        findings["topic"] = topic
+        # Step 4: extract and compose
+        extracted = self._extract(top_sources, topic)
+        findings = self._compose(topic, extracted, top_sources)
 
-        # Step 5: numeric contradiction detection
+        # Step 5/6: contradiction detection
         numeric_contradictions = self._detect_contradictions(findings)
-
-        # Step 6: semantic contradiction detection (NEW — Priority 5)
         semantic_contradictions = self._detect_semantic_contradictions(findings)
-
         findings["contradictions"] = numeric_contradictions + semantic_contradictions
-        findings["sources"] = ranked[:10]
-
         return findings
 
     # ──────────────────────────────────────────────────────────────
     def _rewrite_queries(self, topic: str) -> list:
         prompt = (
-            f'Given this research topic: "{topic}"\n'
-            "Generate exactly 4 search query variants as a JSON array:\n"
-            "1. General natural language query\n"
-            "2. Keyword-focused query (nouns + technical terms only)\n"
-            "3. Pseudo-answer query (what would an expert paper title look like)\n"
-            "4. Core content query (most specific technical formulation)\n\n"
-            "Return ONLY a JSON array of 4 strings. No explanation."
+            f"Generate 4 high-quality search queries for this topic:\n{topic}\n\n"
+            "Rules:\n"
+            "- Make them diverse\n"
+            "- Include one academic-style query\n"
+            "- Include one benchmark-focused query\n\n"
+            "Return ONLY a JSON array of strings."
         )
-        response = self._ask_llm(prompt)
-        try:
-            clean = response.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-            queries = json.loads(clean)
-            if isinstance(queries, list) and len(queries) >= 4:
-                return queries[:4]
-        except Exception:
-            pass
-        # fallback
+        queries = self._safe_json(self._ask_llm(prompt), fallback=[])
+        if isinstance(queries, list) and len(queries) >= 4:
+            return queries[:4]
         return [
             topic,
-            topic + " benchmark",
-            topic + " survey 2024",
-            topic + " neural network",
+            f"{topic} benchmark",
+            f"{topic} survey 2024",
+            f"{topic} academic paper",
         ]
 
-    def _web_search(self, query: str) -> list:
-        """DuckDuckGo instant answer API — free, no key required."""
+    def _tavily_search(self, query: str) -> list:
+        """Tavily search API (advanced mode)."""
+        tavily_api_key = getattr(self, "tavily_api_key", "")
+        if not tavily_api_key:
+            return []
         try:
-            resp = requests.get(
-                "https://api.duckduckgo.com/",
-                params={"q": query, "format": "json", "no_html": 1},
-                timeout=8
+            resp = requests.post(
+                "https://api.tavily.com/search",
+                json={
+                    "api_key": tavily_api_key,
+                    "query": query,
+                    "search_depth": "advanced",
+                    "max_results": 5,
+                },
+                timeout=10,
             )
             data = resp.json()
             results = []
-            for item in data.get("RelatedTopics", [])[:5]:
-                if "Text" in item and item.get("FirstURL"):
-                    results.append({
-                        "title":   item.get("Text", "")[:80],
-                        "url":     item.get("FirstURL", ""),
-                        "snippet": item.get("Text", ""),
-                        "source":  "web",
-                        "score":   0.5,
-                    })
-            return results
-        except Exception:
-            return []
-
-    def _arxiv_search(self, query: str) -> list:
-        """arXiv API — free, no auth required."""
-        try:
-            import urllib.parse
-            import xml.etree.ElementTree as ET
-
-            params = {
-                "search_query": f"all:{urllib.parse.quote(query)}",
-                "start": 0,
-                "max_results": 5,
-                "sortBy": "relevance",
-            }
-            resp = requests.get(
-                "http://export.arxiv.org/api/query",
-                params=params, timeout=10
-            )
-            results = []
-            root = ET.fromstring(resp.text)
-            ns = "{http://www.w3.org/2005/Atom}"
-            for entry in root.findall(f"{ns}entry"):
-                title     = entry.find(f"{ns}title").text.strip()
-                summary   = entry.find(f"{ns}summary").text.strip()[:300]
-                link      = entry.find(f"{ns}id").text.strip()
-                published = entry.find(f"{ns}published").text[:10]
+            for r in data.get("results", []):
                 results.append({
-                    "title":     title,
-                    "url":       link,
-                    "snippet":   summary,
-                    "source":    "arxiv",
-                    "published": published,
-                    "score":     0.8,
+                    "title": r.get("title", ""),
+                    "url": r.get("url", ""),
+                    "snippet": r.get("content", ""),
+                    "source": "web",
+                    "score": 0.5,
                 })
             return results
         except Exception:
             return []
 
+    def _web_search(self, query: str) -> list:
+        """Backward-compatible alias used in tests/legacy code."""
+        return self._tavily_search(query)
+
+    def _arxiv_search(self, query: str) -> list:
+        """Backward-compatible alias used in tests/legacy code."""
+        return self._tavily_search(query)
+
+    def _filter_relevance(self, results: list, topic: str) -> list:
+        topic_words = {w for w in re.findall(r"\w+", topic.lower()) if len(w) > 2}
+        if not topic_words:
+            return results
+
+        filtered = []
+        for r in results:
+            title = r.get("title", "") or ""
+            snippet = r.get("snippet", "") or ""
+            text = f"{title} {snippet}".lower()
+            overlap = sum(1 for w in topic_words if w in text)
+            if overlap >= 2:
+                filtered.append(r)
+        return filtered or results
+
     def _rerank(self, results: list) -> list:
-        """Score = 0.3*recency + 0.3*credibility + 0.4*depth"""
-        import datetime
-        today = datetime.date.today()
+        """Score = 0.4*depth + 0.3*credibility + 0.3*recency"""
+        results = self._deduplicate(results)
+        today = datetime.now().date()
 
         for r in results:
+            url = (r.get("url") or "").lower()
+            snippet = r.get("snippet") or ""
+
             recency = 0.5
-            if "published" in r:
+            if r.get("published"):
                 try:
-                    pub = datetime.date.fromisoformat(r["published"])
+                    pub = datetime.fromisoformat(r["published"]).date()
                     days_old = (today - pub).days
-                    recency = max(0.0, 1.0 - days_old / 730)  # decay over 2 years
+                    recency = max(0.0, 1.0 - days_old / 730)
                 except Exception:
                     pass
 
-            credibility = 0.8 if r.get("source") == "arxiv" else 0.5
-            depth = min(1.0, len(r.get("snippet", "")) / 300)
-            r["final_score"] = 0.3 * recency + 0.3 * credibility + 0.4 * depth
+            credibility = 0.6
+            if "arxiv" in url:
+                credibility = 0.9
+            elif "github" in url:
+                credibility = 0.8
 
-        # deduplicate by URL
-        seen, unique = set(), []
-        for r in results:
-            if r["url"] not in seen:
-                seen.add(r["url"])
-                unique.append(r)
+            depth = min(1.0, len(snippet) / 300)
+            r["final_score"] = 0.4 * depth + 0.3 * credibility + 0.3 * recency
 
-        return sorted(unique, key=lambda x: x["final_score"], reverse=True)
+        return sorted(results, key=lambda x: x.get("final_score", 0.0), reverse=True)
 
     def _extract_findings(self, topic: str, ranked_results: list) -> dict:
+        """Backward-compatible extraction API expected by tests and callers."""
+        result = self._extract(ranked_results, topic)
+        if isinstance(result, dict) and result.get("key_findings"):
+            return result
+        return {
+            "key_findings": ["Could not parse LLM response — check Ollama connection"],
+            "metrics": [],
+            "datasets": [],
+            "limitations": [],
+            "recommended_models": [],
+            "problem_type": "unknown",
+        }
+
+    def _extract(self, sources: list, topic: str) -> dict:
         context = "\n\n".join([
-            f"[{i+1}] {r['title']}\n{r['snippet']}"
-            for i, r in enumerate(ranked_results[:8])
+            f"{i+1}. {s.get('title', '')}\n{s.get('snippet', '')}"
+            for i, s in enumerate(sources)
         ])
         prompt = (
-            f'You are a research analyst. Given this topic: "{topic}"\n\n'
-            f"And these source snippets:\n{context}\n\n"
-            "Extract and return ONLY a JSON object with this exact structure:\n"
+            "You are a technical research analyst.\n\n"
+            f"Topic: {topic}\n\n"
+            f"Sources:\n{context}\n\n"
+            "Extract structured findings.\n\n"
+            "STRICT RULES:\n"
+            "- Include REAL numbers if present\n"
+            "- No vague statements\n"
+            "- Each finding must mention model/dataset/metric\n\n"
+            "Return ONLY JSON with this structure:\n"
             '{\n'
-            '  "key_findings": ["finding 1 with citation [1]", "finding 2 with citation [3]"],\n'
-            '  "metrics": [{"name": "metric_name", "value": "value", "unit": "unit", "source": 1}],\n'
-            '  "datasets": [{"name": "dataset_name", "size": "Xk rows", "task": "task_type"}],\n'
-            '  "limitations": ["limitation 1", "limitation 2"],\n'
-            '  "recommended_models": ["model1", "model2"],\n'
-            '  "problem_type": "classification|regression|nlp|graph"\n'
+            '  "key_findings": [],\n'
+            '  "metrics": [],\n'
+            '  "limitations": [],\n'
+            '  "datasets": [],\n'
+            '  "recommended_models": [],\n'
+            '  "problem_type": "classification|regression|nlp|graph|unknown"\n'
             "}\n\n"
-            "Be specific and cite source numbers. Return ONLY valid JSON."
+            "Return ONLY valid JSON."
         )
-        response = self._ask_llm(prompt)
-        try:
-            clean = response.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-            return json.loads(clean)
-        except Exception:
-            return {
-                "key_findings": ["Could not parse LLM response — check Ollama connection"],
-                "metrics": [],
-                "datasets": [],
-                "limitations": [],
-                "recommended_models": [],
-                "problem_type": "unknown",
-            }
+        return self._safe_json(self._ask_llm(prompt), fallback={})
+
+    def _compose(self, topic: str, extracted: dict, sources: list) -> dict:
+        findings = extracted.get("key_findings", [])
+        metrics = extracted.get("metrics", [])
+        return {
+            "topic": topic,
+            "overview": findings[:3],
+            "current_state": findings[3:6],
+            "key_findings": findings,
+            "limitations": extracted.get("limitations", []),
+            "metrics": metrics,
+            "datasets": extracted.get("datasets", []),
+            "recommended_models": extracted.get("recommended_models", []),
+            "problem_type": extracted.get("problem_type", "unknown"),
+            "sources": sources[:10],
+        }
 
     def _detect_contradictions(self, findings: dict) -> list:
         """Numeric metric variance > 15% signals a contradiction."""
@@ -276,3 +291,23 @@ class V1Research:
             return resp.json().get("response", "")
         except Exception as e:
             return f'{{"error": "Ollama not reachable: {str(e)}"}}'
+
+    def _deduplicate(self, results: list) -> list:
+        seen = set()
+        unique = []
+        for r in results:
+            url = r.get("url")
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            unique.append(r)
+        return unique
+
+    def _safe_json(self, text: str, fallback):
+        try:
+            clean = text.strip()
+            clean = re.sub(r"^```(?:json)?\s*", "", clean, flags=re.IGNORECASE)
+            clean = re.sub(r"\s*```$", "", clean)
+            return json.loads(clean)
+        except Exception:
+            return fallback

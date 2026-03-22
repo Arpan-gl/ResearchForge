@@ -28,6 +28,7 @@ class Pipeline:
         skip_training: bool = False,
         model_override: str = None,
         export: str = None,
+        budget: int = 100,
     ):
         Display.banner()
         Display.section("Starting ResearchForge Pipeline")
@@ -39,80 +40,111 @@ class Pipeline:
         print()
 
         results = {}
+        stage_name = "setup"
 
-        # ── STAGE 1: V1 Research ──────────────────────────────────
-        Display.stage(1, "V1 Research — hybrid retrieval + LLM extraction")
-        v1_result = self.v1.run(topic)
-        results["v1"] = v1_result
-        n_sources = len(v1_result.get("sources", []))
-        n_findings = len(v1_result.get("key_findings", []))
-        n_contradictions = len(v1_result.get("contradictions", []))
-        Display.success(
-            f"{n_sources} sources · {n_findings} findings · "
-            f"{n_contradictions} contradictions flagged"
-        )
-        if v1_result.get("contradictions"):
-            for c in v1_result["contradictions"]:
-                Display.warn(f"  {c}")
-
-        # ── STAGE 2: V2 Dataset Discovery ────────────────────────
-        Display.stage(2, "V2 Datasets — scoring + risk audit")
-        if dataset_path:
-            Display.info("User-provided dataset — running audit only")
-            v2_result = self.v2.audit_user_dataset(dataset_path, v1_result)
-        else:
-            v2_result = self.v2.discover_and_score(topic, v1_result)
-        results["v2"] = v2_result
-        Display.success(
-            f"Dataset: {v2_result['name']} · Score: {v2_result['score']:.2f} · "
-            f"Risks: {len(v2_result.get('risks', []))}"
-        )
-        for r in v2_result.get("risks", []):
-            Display.warn(f"  {r}")
-
-        # ── STAGE 3: V3 Notebook Generation ──────────────────────
-        Display.stage(3, "V3 Notebook — generating runnable .ipynb")
-        v3_result = self.v3.generate(
-            topic=topic,
-            v1_findings=v1_result,
-            v2_dataset=v2_result,
-            model_override=model_override,
-        )
-        results["v3"] = v3_result
-        Display.success(f"Notebook: {v3_result['notebook_path']}")
-        Display.info(f"Model: {v3_result['model']}  ·  Expected {v3_result['metric_name']}: {v3_result['expected_range']}")
-
-        # ── STAGE 4: Autoresearch (GPU training) ─────────────────
-        if not skip_training:
-            Display.stage(4, "Autoresearch — running experiments on your GPU")
-            Display.info("This runs until budget is exhausted.  Ctrl+C to stop early.\n")
-            auto_result = self.auto.run(
-                notebook_path=v3_result["notebook_path"],
-                metric=v3_result["metric_name"],
-                budget=100,
-            )
-            results["autoresearch"] = auto_result
+        try:
+            # ── STAGE 1: V1 Research ──────────────────────────────
+            stage_name = "V1 Research"
+            Display.stage(1, "V1 Research — hybrid retrieval + LLM extraction")
+            v1_result = self.v1.run(topic)
+            results["v1"] = v1_result
+            n_sources = len(v1_result.get("sources", []))
+            n_findings = len(v1_result.get("key_findings", []))
+            n_contradictions = len(v1_result.get("contradictions", []))
             Display.success(
-                f"Best {auto_result['metric']}: {auto_result['best_score']:.3f} "
-                f"(+{auto_result['improvement_pct']:.1f}% from baseline)"
+                f"{n_sources} sources · {n_findings} findings · "
+                f"{n_contradictions} contradictions flagged"
             )
-            Display.info(f"Best commit: {auto_result['best_commit']}  ·  TSV log: {auto_result['tsv_log']}")
-        else:
-            Display.info("GPU training skipped. Open the notebook to train manually.")
+            if v1_result.get("contradictions"):
+                for c in v1_result["contradictions"]:
+                    Display.warn(f"  {c}")
 
-        # ── FINAL OUTPUT ──────────────────────────────────────────
-        Display.section("Pipeline Complete")
-        self._print_summary(results)
-        save_state(results)
+            # ── STAGE 2: V2 Dataset Discovery ────────────────────
+            stage_name = "V2 Datasets"
+            Display.stage(2, "V2 Datasets — scoring + risk audit")
+            if dataset_path:
+                Display.info("User-provided dataset — running audit only")
+                v2_result = self.v2.audit_user_dataset(dataset_path, v1_result)
+            else:
+                v2_result = self.v2.discover_and_score(topic, v1_result)
+            results["v2"] = v2_result
+            Display.success(
+                f"Dataset: {v2_result['name']} · Score: {v2_result['score']:.2f} · "
+                f"Risks: {len(v2_result.get('risks', []))}"
+            )
+            for r in v2_result.get("risks", []):
+                Display.warn(f"  {r}")
 
-        output_path = "researchforge_output.json"
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2, default=str)
-        Display.success(f"Full result JSON saved to {output_path}")
+            dataset_missing = (
+                v2_result.get("score", 0.0) <= 0.0
+                and v2_result.get("source") == "none"
+            ) or "no dataset found" in str(v2_result.get("name", "")).lower()
+            if dataset_missing:
+                results["status"] = "dataset_unavailable"
+                Display.error("No usable dataset found in Stage 2.")
+                Display.info("Provide your own dataset and rerun with: --dataset <path/to/data.csv>")
+                save_state(results)
+                return results
 
-        # Optional export (Priority 6)
-        if export:
-            self._export_report(results, export)
+            # ── STAGE 3: V3 Notebook Generation ──────────────────
+            stage_name = "V3 Notebook"
+            Display.stage(3, "V3 Notebook — generating runnable .ipynb")
+            v3_result = self.v3.generate(
+                topic=topic,
+                v1_findings=v1_result,
+                v2_dataset=v2_result,
+                model_override=model_override,
+            )
+            results["v3"] = v3_result
+            Display.success(f"Notebook: {v3_result['notebook_path']}")
+            Display.info(f"Model: {v3_result['model']}  ·  Expected {v3_result['metric_name']}: {v3_result['expected_range']}")
+
+            # ── STAGE 4: Autoresearch (GPU training) ─────────────
+            if not skip_training:
+                stage_name = "Autoresearch"
+                Display.stage(4, "Autoresearch — running experiments on your GPU")
+                Display.info("This runs until budget is exhausted.  Ctrl+C to stop early.\n")
+                auto_result = self.auto.run(
+                    notebook_path=v3_result["notebook_path"],
+                    metric=v3_result["metric_name"],
+                    budget=budget,
+                )
+                results["autoresearch"] = auto_result
+                Display.success(
+                    f"Best {auto_result['metric']}: {auto_result['best_score']:.3f} "
+                    f"(+{auto_result['improvement_pct']:.1f}% from baseline)"
+                )
+                Display.info(f"Best commit: {auto_result['best_commit']}  ·  TSV log: {auto_result['tsv_log']}")
+            else:
+                Display.info("GPU training skipped. Open the notebook to train manually.")
+
+            # ── FINAL OUTPUT ──────────────────────────────────────
+            Display.section("Pipeline Complete")
+            self._print_summary(results)
+            save_state(results)
+
+            output_path = "researchforge_output.json"
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(results, f, indent=2, default=str)
+            Display.success(f"Full result JSON saved to {output_path}")
+
+            # Optional export (Priority 6)
+            if export:
+                self._export_report(results, export)
+            return results
+
+        except KeyboardInterrupt:
+            Display.warn("Pipeline interrupted by user. Partial results were saved.")
+            results["status"] = "interrupted"
+            save_state(results)
+            return results
+        except Exception as e:
+            Display.error(f"Pipeline failed during {stage_name}: {e}")
+            results["status"] = "failed"
+            results["failed_stage"] = stage_name
+            results["error"] = str(e)
+            save_state(results)
+            raise
 
     def _export_report(self, results: dict, fmt: str):
         """Export the pipeline results to HTML or PDF."""

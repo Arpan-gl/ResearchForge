@@ -53,6 +53,18 @@ class Settings:
             "mlruns"
         )
 
+    @property
+    def tavily_api_key(self) -> str:
+        return os.environ.get("TAVILY_API_KEY") or self._config.get("tavily_api_key", "")
+
+    @property
+    def huggingface_token(self) -> str:
+        return os.environ.get("HUGGINGFACE_TOKEN") or self._config.get("huggingface_token", "")
+
+    @property
+    def openai_api_key(self) -> str:
+        return os.environ.get("OPENAI_API_KEY") or self._config.get("openai_api_key", "")
+
     @classmethod
     def init_wizard(cls):
         """Run on first install: researchforge init"""
@@ -95,12 +107,29 @@ class Settings:
             f"  MLflow tracking URI [{existing.get('mlflow_tracking_uri', 'mlruns')}]: "
         ).strip() or existing.get("mlflow_tracking_uri", "mlruns")
 
+        print("\n  Optional API integrations (press Enter to skip):")
+
+        tavily_key = input(
+            f"  Tavily API key [{existing.get('tavily_api_key', '')}]: "
+        ).strip() or existing.get("tavily_api_key", "")
+
+        hf_token = input(
+            f"  Hugging Face token [{existing.get('huggingface_token', '')}]: "
+        ).strip() or existing.get("huggingface_token", "")
+
+        openai_key = input(
+            f"  OpenAI API key [{existing.get('openai_api_key', '')}]: "
+        ).strip() or existing.get("openai_api_key", "")
+
         config = {
             "ollama_url": ollama_url,
             "model": model,
             "kaggle_username": kaggle_user,
             "kaggle_key": kaggle_key,
             "mlflow_tracking_uri": mlflow_uri,
+            "tavily_api_key": tavily_key,
+            "huggingface_token": hf_token,
+            "openai_api_key": openai_key,
         }
         with open(config_path, "w") as f:
             json.dump(config, f, indent=2)
@@ -110,4 +139,7 @@ class Settings:
         if kaggle_user:
             print(f"  ✓ Kaggle: {kaggle_user}")
         print(f"  ✓ MLflow tracking URI: {mlflow_uri}")
+        print(f"  ✓ Tavily API key: {'set' if tavily_key else 'not set'}")
+        print(f"  ✓ Hugging Face token: {'set' if hf_token else 'not set'}")
+        print(f"  ✓ OpenAI API key: {'set' if openai_key else 'not set'}")
         print("\n  Ready. Try: researchforge run \"your research topic\"\n")

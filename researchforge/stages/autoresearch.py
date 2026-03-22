@@ -21,10 +21,12 @@ import os
 import csv
 import json
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
 import copy
+import re
 import requests
 from pathlib import Path
 
@@ -74,29 +76,43 @@ class Autoresearch:
         best_commit = "baseline"
         experiments_run = 0
         history: list[dict] = []
+        parse_failures = 0
+        fallback_used = 0
+
+        fallback_budget = 0
+        if budget > 0:
+            fallback_budget = max(1, int(budget * 0.2))
 
         try:
             for i in range(budget):
                 experiments_run += 1
                 print(f"\n  Experiment {i+1}/{budget} ", end="", flush=True)
 
-                suggestion = self._suggest_modification(history, metric, best_score)
-                if not suggestion:
-                    print("(no suggestion from LLM) — skipping")
-                    continue
+                suggestion, source, reason = self._next_suggestion(
+                    index=i,
+                    fallback_budget=fallback_budget,
+                    history=history,
+                    metric=metric,
+                    best_score=best_score,
+                )
+                if source == "fallback":
+                    fallback_used += 1
+                if reason != "ok":
+                    parse_failures += 1
+                    Display.warn(f"Suggestion parser: {reason}. Using deterministic fallback.")
 
                 desc = suggestion.get("description", "?")[:55]
-                print(f"→ {desc}…", end=" ", flush=True)
+                print(f"→ {desc} ({source})…", end=" ", flush=True)
 
                 # Run with 3 seeds (crash-safe)
                 scores, crashed = self._run_experiment(
-                    notebook_path, suggestion, self.SEEDS, experiment_timeout
+                    notebook_path, suggestion, self.SEEDS, experiment_timeout, metric
                 )
 
                 if crashed or not scores:
                     print("✗ CRASH")
                     self._log_tsv(tsv_path, "unknown", 0.0, 0.0, "crash", desc)
-                    history.append({"description": desc, "score": 0.0, "accepted": False})
+                    history.append({"description": desc, "score": 0.0, "accepted": False, "source": source})
                     if tracker:
                         tracker.log_experiment(suggestion, [0.0], accepted=False, metric_name=metric)
                     continue
@@ -117,11 +133,11 @@ class Autoresearch:
                     delta = mean_score - baseline
                     print(f"✓ {mean_score:.4f} (+{delta:.4f}) → committed {commit_hash[:7]}")
                     self._log_tsv(tsv_path, commit_hash[:7], mean_score, 0.0, "keep", desc)
-                    history.append({"description": desc, "score": mean_score, "accepted": True})
+                    history.append({"description": desc, "score": mean_score, "accepted": True, "source": source})
                 else:
                     print(f"✗ {mean_score:.4f} (need >{threshold:.4f}) → discarded")
                     self._log_tsv(tsv_path, "—", mean_score, 0.0, "discard", desc)
-                    history.append({"description": desc, "score": mean_score, "accepted": False})
+                    history.append({"description": desc, "score": mean_score, "accepted": False, "source": source})
 
                 if tracker:
                     tracker.log_experiment(suggestion, scores, accepted=accepted, metric_name=metric)
@@ -145,6 +161,8 @@ class Autoresearch:
             "branch":           branch_tag,
             "tsv_log":          tsv_path,
             "history":          history,
+            "parse_failures":   parse_failures,
+            "fallback_used":    fallback_used,
         }
 
     # ── Git helpers (Karpathy pattern) ────────────────────────────
@@ -221,22 +239,34 @@ class Autoresearch:
         """Execute the notebook as-is and parse the metric from output."""
         tmp_out = os.path.join(tempfile.gettempdir(), "rf_baseline.ipynb")
         try:
-            result = subprocess.run(
-                [
-                    "jupyter", "nbconvert", "--to", "notebook",
-                    "--execute", "--output", tmp_out,
-                    "--ExecutePreprocessor.timeout", str(timeout),
-                    "--ExecutePreprocessor.kernel_name", "python3",
-                    notebook_path,
-                ],
-                capture_output=True, text=True, timeout=timeout + 60,
+            output, return_code, timed_out = self._execute_notebook(
+                notebook_path=notebook_path,
+                output_path=tmp_out,
+                timeout=timeout,
             )
-            score = self._parse_metric_from_output(result.stdout + result.stderr, metric)
+
+            if timed_out:
+                Display.warn(f"Baseline timed out after {timeout}s — using estimate 0.70")
+                return 0.70
+            if return_code != 0:
+                snippet = self._extract_error_snippet(output)
+                if snippet:
+                    Display.warn(
+                        f"Baseline execution failed (exit={return_code}). First error:\n{snippet}\nUsing estimate 0.70"
+                    )
+                else:
+                    Display.warn(f"Baseline execution failed (exit={return_code}) — using estimate 0.70")
+                return 0.70
+
+            score = self._parse_metric_from_output(output, metric)
             if score is not None:
                 return score
             # Try to read from executed notebook output cells
             score = self._parse_metric_from_notebook(tmp_out, metric)
             return score if score is not None else 0.70
+        except KeyboardInterrupt:
+            Display.warn("Baseline interrupted by user.")
+            raise
         except Exception as e:
             Display.warn(f"Baseline execution error: {e} — using estimate 0.70")
             return 0.70
@@ -249,6 +279,7 @@ class Autoresearch:
         suggestion: dict,
         seeds: list,
         timeout: int,
+        metric: str,
     ) -> tuple[list, bool]:
         """
         Real notebook execution with nbconvert.
@@ -281,25 +312,31 @@ class Autoresearch:
 
                     # 5. Execute with nbconvert
                     output_nb = os.path.join(tmp_dir, f"out_seed{seed}.ipynb")
-                    result = subprocess.run(
-                        [
-                            "jupyter", "nbconvert", "--to", "notebook",
-                            "--execute", "--output", output_nb,
-                            "--ExecutePreprocessor.timeout", str(timeout),
-                            "--ExecutePreprocessor.kernel_name", "python3",
-                            tmp_nb,
-                        ],
-                        capture_output=True, text=True,
-                        timeout=timeout + 60,
+                    all_output, return_code, timed_out = self._execute_notebook(
+                        notebook_path=tmp_nb,
+                        output_path=output_nb,
+                        timeout=timeout,
                     )
 
+                    if timed_out:
+                        Display.warn(f"  Seed {seed}: timed out after {timeout}s — skipped")
+                        continue
+                    if return_code != 0:
+                        snippet = self._extract_error_snippet(all_output)
+                        if snippet:
+                            Display.warn(f"  Seed {seed}: execution failed (exit={return_code})\n{snippet}")
+                        else:
+                            Display.warn(f"  Seed {seed}: execution failed (exit={return_code})")
+                        continue
+
                     # 6. Parse metric from stdout/stderr then from executed notebook
-                    all_output = result.stdout + result.stderr
-                    score = self._parse_metric_from_output(all_output, "F1")
+                    score = self._parse_metric_from_output(all_output, metric)
                     if score is None:
-                        score = self._parse_metric_from_notebook(output_nb, "F1")
+                        score = self._parse_metric_from_notebook(output_nb, metric)
                     if score is None:
-                        score = self._parse_metric_from_output(all_output, "f1")
+                        score = self._parse_metric_from_output(all_output, "F1")
+                        if score is None:
+                            score = self._parse_metric_from_output(all_output, "f1")
                     if score is None:
                         score = self._parse_metric_from_output(all_output, "accuracy")
 
@@ -309,8 +346,8 @@ class Autoresearch:
                     else:
                         Display.warn(f"  Seed {seed}: could not parse metric from output")
 
-                except subprocess.TimeoutExpired:
-                    Display.warn(f"  Seed {seed}: timed out after {timeout}s — skipped")
+                except KeyboardInterrupt:
+                    raise
                 except Exception as e:
                     Display.warn(f"  Seed {seed}: {e}")
 
@@ -322,6 +359,53 @@ class Autoresearch:
 
         crashed = not any_success
         return scores, crashed
+
+    def _execute_notebook(self, notebook_path: str, output_path: str, timeout: int) -> tuple[str, int, bool]:
+        """Execute a notebook via nbconvert with explicit child-process cleanup."""
+        cmd = [
+            "jupyter", "nbconvert", "--to", "notebook",
+            "--execute", "--output", output_path,
+            "--ExecutePreprocessor.timeout", str(timeout),
+            "--ExecutePreprocessor.kernel_name", "python3",
+            notebook_path,
+        ]
+
+        popen_kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout + 60)
+            return stdout + stderr, proc.returncode, False
+        except subprocess.TimeoutExpired as e:
+            self._terminate_process(proc)
+            timed_out_output = (e.stdout or "") + (e.stderr or "")
+            return timed_out_output, -1, True
+        except KeyboardInterrupt:
+            self._terminate_process(proc)
+            raise
+
+    def _terminate_process(self, proc: subprocess.Popen):
+        """Terminate notebook execution process and its group when possible."""
+        try:
+            if os.name == "nt":
+                proc.terminate()
+            else:
+                os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
 
     def _apply_code_change(self, nb, suggestion: dict) -> object:
         """
@@ -397,7 +481,7 @@ class Autoresearch:
 
     def _suggest_modification(
         self, history: list, metric: str, best_score: float
-    ) -> dict | None:
+    ) -> tuple[dict | None, str]:
         rejected = [h["description"] for h in history if not h["accepted"]]
         accepted = [h["description"] for h in history if h["accepted"]]
 
@@ -423,11 +507,125 @@ class Autoresearch:
         )
 
         response = self._ask_llm(prompt)
+        return self._parse_suggestion_response(response)
+
+    def _next_suggestion(
+        self,
+        index: int,
+        fallback_budget: int,
+        history: list,
+        metric: str,
+        best_score: float,
+    ) -> tuple[dict, str, str]:
+        if index < fallback_budget:
+            return self._deterministic_fallback(index), "fallback", "ok"
+
+        parsed, reason = self._suggest_modification(history, metric, best_score)
+        if parsed is not None:
+            return parsed, "llm", "ok"
+
+        return self._deterministic_fallback(index), "fallback", reason
+
+    def _parse_suggestion_response(self, response: str) -> tuple[dict | None, str]:
+        required_keys = {"description", "target_section", "code_change", "expected_gain"}
+        allowed_sections = {"model", "training", "preprocessing", "features"}
+
+        raw = (response or "").strip()
+        if not raw:
+            return None, "empty_response"
+
+        clean = raw
+        if clean.startswith("```"):
+            clean = re.sub(r"^```(?:json)?", "", clean, flags=re.IGNORECASE).strip()
+            clean = re.sub(r"```$", "", clean).strip()
+
+        parsed_obj = None
         try:
-            clean = response.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-            return json.loads(clean)
+            parsed_obj = json.loads(clean)
         except Exception:
-            return None
+            match = re.search(r"\{[\s\S]*\}", clean)
+            if not match:
+                return None, "malformed_json"
+            try:
+                parsed_obj = json.loads(match.group(0))
+            except Exception:
+                return None, "malformed_json"
+
+        if not isinstance(parsed_obj, dict):
+            return None, "json_not_object"
+
+        missing = sorted(required_keys - set(parsed_obj.keys()))
+        if missing:
+            return None, f"missing_keys:{','.join(missing)}"
+
+        section = str(parsed_obj.get("target_section", "")).strip().lower()
+        if section not in allowed_sections:
+            return None, "invalid_target_section"
+
+        suggestion = {
+            "description": str(parsed_obj.get("description", "")).strip(),
+            "target_section": section,
+            "code_change": str(parsed_obj.get("code_change", "")).strip(),
+            "expected_gain": str(parsed_obj.get("expected_gain", "")).strip(),
+        }
+        if not suggestion["description"] or not suggestion["code_change"]:
+            return None, "empty_required_values"
+
+        return suggestion, "ok"
+
+    def _deterministic_fallback(self, index: int) -> dict:
+        suggestions = [
+            {
+                "description": "Tune XGBoost tree depth and learning rate",
+                "target_section": "model",
+                "code_change": "model = xgb.XGBClassifier() → model = xgb.XGBClassifier(n_estimators=400, learning_rate=0.05, max_depth=6, subsample=0.9, colsample_bytree=0.9, random_state=42)",
+                "expected_gain": "2-6%",
+            },
+            {
+                "description": "Reduce holdout size to retain more training data",
+                "target_section": "preprocessing",
+                "code_change": "test_size=0.2 → test_size=0.15",
+                "expected_gain": "1-3%",
+            },
+            {
+                "description": "Increase LightGBM capacity and regularization",
+                "target_section": "model",
+                "code_change": "model = lgb.LGBMClassifier() → model = lgb.LGBMClassifier(n_estimators=500, learning_rate=0.04, num_leaves=63, subsample=0.9, colsample_bytree=0.9, reg_lambda=0.5, random_state=42)",
+                "expected_gain": "2-5%",
+            },
+            {
+                "description": "Switch imputation strategy for sparse numeric features",
+                "target_section": "preprocessing",
+                "code_change": "strategy=\"median\" → strategy=\"most_frequent\"",
+                "expected_gain": "1-2%",
+            },
+        ]
+        return suggestions[index % len(suggestions)]
+
+    def _extract_error_snippet(self, output: str) -> str:
+        text = (output or "").strip()
+        if not text:
+            return ""
+
+        lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+        traceback_idx = None
+        for idx, line in enumerate(lines):
+            if "Traceback (most recent call last)" in line:
+                traceback_idx = idx
+                break
+
+        if traceback_idx is not None:
+            snippet = lines[traceback_idx:traceback_idx + 8]
+            return "\n".join(snippet)
+
+        error_lines = [
+            line for line in lines
+            if any(token in line for token in ["Error", "Exception", "FileNotFound", "ValueError", "KeyError"])
+        ]
+        if error_lines:
+            return "\n".join(error_lines[:4])
+
+        return "\n".join(lines[-6:])
 
     # ── Metric parsing ────────────────────────────────────────────
 

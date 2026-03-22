@@ -1,0 +1,38 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+    # If you want GPU acceleration and Docker GPU support is enabled,
+    # uncomment the line below:
+    # gpus: all
+
+  ollama-pull:
+    image: curlimages/curl:8.12.1
+    container_name: ollama-pull-llama31
+    depends_on:
+      ollama:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - |
+        echo "Pulling model llama3.1:8b..."
+        curl -fsS http://ollama:11434/api/pull \
+          -H "Content-Type: application/json" \
+          -d '{"name":"llama3.1:8b"}'
+        echo "Model pull request sent."
+    restart: "no"
+
+volumes:
+  ollama_data:

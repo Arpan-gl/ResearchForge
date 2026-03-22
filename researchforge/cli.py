@@ -16,9 +16,22 @@ Usage:
 
 import argparse
 import sys
+import warnings
+
+
+def _configure_warning_filters():
+    """Hide one noisy third-party warning without muting unrelated warnings."""
+    warnings.filterwarnings(
+        "ignore",
+        message=r'Field "model_name" has conflict with protected namespace "model_"\..*',
+        category=UserWarning,
+        module=r"pydantic\._internal\._fields",
+    )
 
 
 def main():
+    _configure_warning_filters()
+
     parser = argparse.ArgumentParser(
         prog="researchforge",
         description="ResearchForge — topic to trained model, fully automated.",
@@ -86,6 +99,7 @@ def main():
             skip_training=args.skip_training,
             model_override=args.model,
             export=args.export,
+            budget=args.budget,
         )
 
     elif args.command == "chat":
