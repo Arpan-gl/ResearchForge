@@ -87,6 +87,33 @@ class Pipeline:
                 save_state(results)
                 return results
 
+            def import_external_folder(self, src_path: str, dest_root: str = "imports") -> str:
+                """Copy an external folder into the workspace under `imports/<basename>`.
+
+                Returns the destination path.
+                """
+                src = os.path.abspath(src_path)
+                if not os.path.exists(src):
+                    raise FileNotFoundError(f"External path not found: {src}")
+
+                base = os.path.basename(src.rstrip(os.path.sep)) or "external"
+                dest_root_abs = os.path.abspath(dest_root)
+                os.makedirs(dest_root_abs, exist_ok=True)
+                dest = os.path.join(dest_root_abs, f"{base}_{int(time.time())}")
+                try:
+                    if os.path.isdir(src):
+                        import shutil
+
+                        shutil.copytree(src, dest)
+                    else:
+                        os.makedirs(dest, exist_ok=True)
+                        import shutil
+
+                        shutil.copy2(src, os.path.join(dest, os.path.basename(src)))
+                    return dest
+                except Exception as e:
+                    raise RuntimeError(f"Failed to import external folder: {e}")
+
             # ── STAGE 3: V3 Notebook Generation ──────────────────
             stage_name = "V3 Notebook"
             Display.stage(3, "V3 Notebook — generating runnable .ipynb")
@@ -99,6 +126,8 @@ class Pipeline:
             results["v3"] = v3_result
             Display.success(f"Notebook: {v3_result['notebook_path']}")
             Display.info(f"Model: {v3_result['model']}  ·  Expected {v3_result['metric_name']}: {v3_result['expected_range']}")
+            if v3_result.get("model_package_dir"):
+                Display.info(f"Model package: {v3_result['model_package_dir']}")
 
             # ── STAGE 4: Autoresearch (GPU training) ─────────────
             if not skip_training:
@@ -184,6 +213,8 @@ class Pipeline:
         print(f"  │  Dataset score     : {v2.get('score', 0):.2f}{'':<23}│")
         print(f"  │  Model             : {v3.get('model','—')[:26]:<26}│")
         print(f"  │  Notebook          : {v3.get('notebook_path','—')[:26]:<26}│")
+        if v3.get("model_package_dir"):
+            print(f"  │  Model package     : {v3.get('model_package_dir','—')[:26]:<26}│")
         if auto:
             print(f"  │  Baseline {metric:8s}: {auto.get('baseline_score', 0):.3f}{'':<22}│")
             print(f"  │  Best     {metric:8s}: {auto.get('best_score', 0):.3f}{'':<22}│")

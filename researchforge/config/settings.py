@@ -65,6 +65,21 @@ class Settings:
     def openai_api_key(self) -> str:
         return os.environ.get("OPENAI_API_KEY") or self._config.get("openai_api_key", "")
 
+    @property
+    def semantic_scholar_key(self) -> str:
+        return os.environ.get("SEMANTIC_SCHOLAR_KEY") or self._config.get("semantic_scholar_key", "")
+
+    @property
+    def github_token(self) -> str:
+        return os.environ.get("GITHUB_TOKEN") or self._config.get("github_token", "")
+
+    @property
+    def enable_multi_source(self) -> bool:
+        raw = os.environ.get("RF_MULTI_SOURCE") or self._config.get("enable_multi_source", False)
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
     @classmethod
     def init_wizard(cls):
         """Run on first install: researchforge init"""
@@ -121,6 +136,18 @@ class Settings:
             f"  OpenAI API key [{existing.get('openai_api_key', '')}]: "
         ).strip() or existing.get("openai_api_key", "")
 
+        semantic_key = input(
+            f"  Semantic Scholar API key [{existing.get('semantic_scholar_key', '')}]: "
+        ).strip() or existing.get("semantic_scholar_key", "")
+
+        github_token = input(
+            f"  GitHub token (for repo search) [{existing.get('github_token', '')}]: "
+        ).strip() or existing.get("github_token", "")
+
+        enable_multi_source = input(
+            f"  Enable multi-source retrieval (true/false) [{existing.get('enable_multi_source', False)}]: "
+        ).strip() or existing.get("enable_multi_source", False)
+
         config = {
             "ollama_url": ollama_url,
             "model": model,
@@ -130,6 +157,9 @@ class Settings:
             "tavily_api_key": tavily_key,
             "huggingface_token": hf_token,
             "openai_api_key": openai_key,
+            "semantic_scholar_key": semantic_key,
+            "github_token": github_token,
+            "enable_multi_source": enable_multi_source,
         }
         with open(config_path, "w") as f:
             json.dump(config, f, indent=2)
