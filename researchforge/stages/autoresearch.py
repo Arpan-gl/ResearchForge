@@ -261,7 +261,41 @@ class Autoresearch:
                 f"autoresearch: {suggestion['description']} "
                 f"→ {metric}={score:.4f}"
             )
-            subprocess.run(["git", "add", notebook_path], capture_output=True)
+            # Add notebook and any package files modified by the suggestion
+            files_to_add = [notebook_path]
+            # If suggestion targeted package files, try to locate and add them
+            targ = suggestion.get("target_section", "").lower()
+            if targ in {"config", "train", "model_file", "inference"}:
+                base_dir = os.path.dirname(os.path.abspath(notebook_path)) or "."
+                candidates = []
+                mapping = {
+                    "config": ["config.yaml", "config.yml"],
+                    "train": ["train.py"],
+                    "model_file": ["model.py"],
+                    "inference": ["inference.py"],
+                }
+                for name in mapping.get(targ, []):
+                    candidates.append(os.path.join(base_dir, name))
+                out_model_dir = os.path.join(os.getcwd(), "outputs", "model")
+                try:
+                    if os.path.isdir(out_model_dir):
+                        for sub in sorted(os.listdir(out_model_dir), reverse=True):
+                            subdir = os.path.join(out_model_dir, sub)
+                            if not os.path.isdir(subdir):
+                                continue
+                            for name in mapping.get(targ, []):
+                                candidates.append(os.path.join(subdir, name))
+                except Exception:
+                    pass
+                for p in candidates:
+                    if p and os.path.exists(p):
+                        files_to_add.append(p)
+
+            for fpath in files_to_add:
+                try:
+                    subprocess.run(["git", "add", fpath], capture_output=True)
+                except Exception:
+                    pass
             subprocess.run(
                 ["git", "commit", "-m", msg],
                 capture_output=True, text=True
@@ -361,6 +395,75 @@ class Autoresearch:
             # Load original notebook
             with open(notebook_path, encoding="utf-8") as f:
                 original_nb = nbformat.read(f, as_version=4)
+
+            # If suggestion targets package files, attempt a file-level change and run train.py
+            targ = suggestion.get("target_section", "").lower()
+            if targ in {"config", "train", "model_file", "inference"}:
+                applied = self._apply_file_change(notebook_path, suggestion)
+                if applied:
+                    # Find train.py next to notebook or under outputs/model/* and run it once
+                    base_dir = os.path.dirname(os.path.abspath(notebook_path)) or "."
+                    train_candidates = [os.path.join(base_dir, "train.py")]
+                    out_model_dir = os.path.join(os.getcwd(), "outputs", "model")
+                    try:
+                        if os.path.isdir(out_model_dir):
+                            for sub in sorted(os.listdir(out_model_dir), reverse=True):
+                                subdir = os.path.join(out_model_dir, sub)
+                                if not os.path.isdir(subdir):
+                                    continue
+                                train_candidates.append(os.path.join(subdir, "train.py"))
+                    except Exception:
+                        pass
+
+                    train_cmd = None
+                    train_workdir = None
+                    for tpath in train_candidates:
+                        if os.path.exists(tpath):
+                            train_cmd = ["python", tpath]
+                            train_workdir = os.path.dirname(tpath)
+                            break
+
+                    if train_cmd:
+                        try:
+                            proc = subprocess.run(train_cmd, cwd=train_workdir, capture_output=True, text=True, timeout=1800)
+                            stdout = proc.stdout or ""
+                            stderr = proc.stderr or ""
+                        except Exception as e:
+                            stdout = ""
+                            stderr = str(e)
+
+                        metrics = {}
+                        try:
+                            metrics_path = os.path.join(train_workdir, "metrics.json")
+                            if os.path.exists(metrics_path):
+                                with open(metrics_path, "r", encoding="utf-8") as mf:
+                                    metrics = json.load(mf)
+                        except Exception:
+                            metrics = {}
+
+                        # Interpret metrics to produce per-seed-like scores: repeat the single metric
+                        primary_val = None
+                        for k in [metric, "f1", "accuracy", "val_loss"]:
+                            if k in metrics:
+                                primary_val = metrics[k]
+                                break
+                        if primary_val is not None:
+                            scores = [float(primary_val)] * len(seeds)
+                            any_success = True
+                        else:
+                            # Attempt to parse numeric from stdout
+                            parsed = self._parse_metric_from_output(stdout, metric)
+                            if parsed is not None:
+                                scores = [parsed] * len(seeds)
+                                any_success = True
+                            else:
+                                Display.warn("File-change train executed but no metrics produced or parsed")
+                    else:
+                        Display.warn("File-change applied but no train.py found to execute")
+                else:
+                    Display.warn("Suggestion targeted files but no matching file was modified")
+                # Return early — we've attempted file-level execution
+                return scores, not any_success
 
             for seed in seeds:
                 try:
@@ -537,6 +640,12 @@ class Autoresearch:
 
         cell = nb.cells[best_cell_idx]
 
+        # If suggestion targets a package file, leave notebook unchanged here.
+        target = suggestion.get("target_section", "").lower()
+        if target in {"config", "train", "model_file", "inference"}:
+            # Caller may handle file-level changes separately; return nb unchanged
+            return nb
+
         # Try exact-string replacement if code_change contains "→" or "="
         # The suggestion format: "old_value → new_value" or just new code
         if "→" in code_change:
@@ -554,6 +663,68 @@ class Autoresearch:
 
         nb.cells[best_cell_idx] = cell
         return nb
+
+    def _apply_file_change(self, notebook_path: str, suggestion: dict) -> bool:
+        """Apply suggestion to a target file (config.yaml, train.py, model.py, inference.py).
+
+        Returns True if a file was modified, False otherwise.
+        """
+        code_change = suggestion.get("code_change", "")
+        if not code_change:
+            return False
+
+        target = suggestion.get("target_section", "").lower()
+        target_filename_map = {
+            "config": ["config.yaml", "config.yml"],
+            "train": ["train.py"],
+            "model_file": ["model.py"],
+            "inference": ["inference.py"],
+        }
+
+        candidates = []
+        base_dir = os.path.dirname(os.path.abspath(notebook_path)) or "."
+        # Primary candidates next to notebook
+        for name in target_filename_map.get(target, []):
+            candidates.append(os.path.join(base_dir, name))
+
+        # Also search outputs/model/* for matching files
+        out_model_dir = os.path.join(os.getcwd(), "outputs", "model")
+        try:
+            if os.path.isdir(out_model_dir):
+                for sub in sorted(os.listdir(out_model_dir), reverse=True):
+                    subdir = os.path.join(out_model_dir, sub)
+                    if not os.path.isdir(subdir):
+                        continue
+                    for name in target_filename_map.get(target, []):
+                        candidates.append(os.path.join(subdir, name))
+        except Exception:
+            pass
+
+        for path in candidates:
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+
+                if "→" in code_change:
+                    parts = code_change.split("→", 1)
+                    old_part = parts[0].strip()
+                    new_part = parts[1].strip()
+                    if old_part in content:
+                        new_content = content.replace(old_part, new_part, 1)
+                    else:
+                        new_content = content + f"\n# autoresearch: {code_change}\n{new_part}\n"
+                else:
+                    new_content = content + f"\n# autoresearch change:\n{code_change}\n"
+
+                if new_content != content:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(new_content)
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _inject_seed(self, nb, seed: int) -> object:
         """Replace random_state=42 with the given seed in all code cells."""
@@ -586,7 +757,7 @@ class Autoresearch:
             "Return ONLY a JSON object:\n"
             "{\n"
             '  "description": "Brief description of the change",\n'
-            '  "target_section": "model|training|preprocessing|features",\n'
+            '  "target_section": "model|training|preprocessing|features|config|train|model_file|inference",\n'
             '  "code_change": "old_code → new_code  (use → to indicate replacement, or just new code to append)",\n'
             '  "expected_gain": "estimated % improvement"\n'
             "}\n\n"
@@ -615,7 +786,7 @@ class Autoresearch:
 
     def _parse_suggestion_response(self, response: str) -> tuple[dict | None, str]:
         required_keys = {"description", "target_section", "code_change", "expected_gain"}
-        allowed_sections = {"model", "training", "preprocessing", "features"}
+        allowed_sections = {"model", "training", "preprocessing", "features", "config", "train", "model_file", "inference"}
 
         raw = (response or "").strip()
         if not raw:

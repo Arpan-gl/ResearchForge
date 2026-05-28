@@ -2,11 +2,12 @@
 V1 Research Pipeline
 --------------------
 1. Rewrite topic into 4 query variants
-2. Search via Tavily in parallel
+2. Multi-source retrieval (Tavily + optional academic sources)
 3. Deduplicate + relevance filter + rerank
 4. Extract structured findings via Ollama LLM
-5. Flag numeric contradictions
-6. Flag semantic contradictions via Ollama pairwise comparison
+5. Build research memory (chunking + embedding rerank)
+6. Flag numeric contradictions
+7. Flag semantic contradictions via Ollama pairwise comparison
 """
 
 import requests
@@ -28,13 +29,17 @@ class V1Research:
             or os.environ.get("TAVILY_API_KEY")
             or self.settings.tavily_api_key
         )
+        self.semantic_scholar_key = self.settings.semantic_scholar_key
+        self.github_token = self.settings.github_token
+        self.hf_token = self.settings.huggingface_token
+        self.multi_source = self.settings.enable_multi_source
 
     def run(self, topic: str) -> dict:
         queries = self._rewrite_queries(topic)
 
-        # Step 2: parallel Tavily search
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = [executor.submit(self._tavily_search, q) for q in queries]
+        # Step 2: parallel multi-source retrieval (gated)
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            futures = [executor.submit(self._collect_sources, q) for q in queries]
             results = []
             for f in futures:
                 results.extend(f.result())
@@ -49,7 +54,14 @@ class V1Research:
         extracted = self._extract(top_sources, topic)
         findings = self._compose(topic, extracted, top_sources)
 
-        # Step 5/6: contradiction detection
+        # Step 5: build research memory (lightweight chunk + embed)
+        memory = self._build_research_memory(topic, top_sources)
+        findings["research_memory"] = memory
+
+        # Step 6: structured research blueprint (optional LLM pass)
+        findings["research_blueprint"] = self._extract_research_blueprint(topic, top_sources)
+
+        # Step 7/8: contradiction detection
         numeric_contradictions = self._detect_contradictions(findings)
         semantic_contradictions = self._detect_semantic_contradictions(findings)
         findings["contradictions"] = numeric_contradictions + semantic_contradictions
@@ -111,7 +123,112 @@ class V1Research:
 
     def _arxiv_search(self, query: str) -> list:
         """Backward-compatible alias used in tests/legacy code."""
-        return self._tavily_search(query)
+        if not self.multi_source:
+            return []
+        return self._search_arxiv(query)
+
+    def _collect_sources(self, query: str) -> list:
+        sources = []
+        sources.extend(self._web_search(query))
+        if getattr(self, "multi_source", False):
+            sources.extend(self._search_arxiv(query))
+            sources.extend(self._search_semantic_scholar(query))
+            sources.extend(self._search_hf_papers(query))
+            sources.extend(self._search_github(query))
+        return sources
+
+    def _search_arxiv(self, query: str, max_results: int = 4) -> list:
+        try:
+            import arxiv
+            search = arxiv.Search(query=query, max_results=max_results, sort_by=arxiv.SortCriterion.Relevance)
+            client = arxiv.Client()
+            results = []
+            for res in client.results(search):
+                results.append({
+                    "title": res.title,
+                    "url": res.entry_id,
+                    "snippet": (res.summary or "")[:800],
+                    "source": "arxiv",
+                    "published": res.published.date().isoformat() if res.published else None,
+                })
+            return results
+        except Exception:
+            return []
+
+    def _search_semantic_scholar(self, query: str, max_results: int = 4) -> list:
+        if not getattr(self, "semantic_scholar_key", ""):
+            return []
+        try:
+            resp = requests.get(
+                "https://api.semanticscholar.org/graph/v1/paper/search",
+                params={
+                    "query": query,
+                    "limit": max_results,
+                    "fields": "title,url,abstract,year,citationCount,venue",
+                },
+                headers={"x-api-key": getattr(self, "semantic_scholar_key", "")},
+                timeout=10,
+            )
+            data = resp.json()
+            results = []
+            for item in data.get("data", []):
+                results.append({
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "snippet": (item.get("abstract") or "")[:800],
+                    "source": "semantic_scholar",
+                    "published": str(item.get("year") or ""),
+                })
+            return results
+        except Exception:
+            return []
+
+    def _search_hf_papers(self, query: str, max_results: int = 4) -> list:
+        if not getattr(self, "hf_token", ""):
+            return []
+        try:
+            resp = requests.get(
+                "https://huggingface.co/api/papers",
+                params={"search": query, "limit": max_results},
+                headers={"Authorization": f"Bearer {getattr(self, 'hf_token', '')}"},
+                timeout=10,
+            )
+            results = []
+            for item in resp.json():
+                title = item.get("title") or item.get("paper", {}).get("title", "")
+                url = item.get("url") or item.get("paper", {}).get("url", "")
+                summary = item.get("summary") or item.get("abstract", "")
+                results.append({
+                    "title": title,
+                    "url": url,
+                    "snippet": (summary or "")[:800],
+                    "source": "hf_papers",
+                })
+            return results
+        except Exception:
+            return []
+
+    def _search_github(self, query: str, max_results: int = 4) -> list:
+        if not getattr(self, "github_token", ""):
+            return []
+        try:
+            resp = requests.get(
+                "https://api.github.com/search/repositories",
+                params={"q": query, "sort": "stars", "order": "desc", "per_page": max_results},
+                headers={"Authorization": f"Bearer {getattr(self, 'github_token', '')}"},
+                timeout=10,
+            )
+            results = []
+            for item in resp.json().get("items", []):
+                results.append({
+                    "title": item.get("full_name", ""),
+                    "url": item.get("html_url", ""),
+                    "snippet": (item.get("description") or "")[:400],
+                    "source": "github",
+                })
+            return results
+        except Exception:
+            return []
 
     def _filter_relevance(self, results: list, topic: str) -> list:
         topic_words = {w for w in re.findall(r"\w+", topic.lower()) if len(w) > 2}
@@ -198,6 +315,32 @@ class V1Research:
         )
         return self._safe_json(self._ask_llm(prompt), fallback={})
 
+    def _extract_research_blueprint(self, topic: str, sources: list) -> dict:
+        if not sources:
+            return {}
+        context = "\n\n".join([
+            f"{i+1}. {s.get('title', '')}\n{s.get('snippet', '')}"
+            for i, s in enumerate(sources)
+        ])
+        prompt = (
+            "You are a research analyst. Build a structured research memory.\n\n"
+            f"Topic: {topic}\n\n"
+            f"Sources:\n{context}\n\n"
+            "Return ONLY JSON with this structure:\n"
+            "{\n"
+            "  \"problem_definition\": \"\",\n"
+            "  \"datasets_used\": [],\n"
+            "  \"architectures\": [],\n"
+            "  \"metrics\": [],\n"
+            "  \"limitations\": [],\n"
+            "  \"contradictions\": [],\n"
+            "  \"future_work\": [],\n"
+            "  \"reproducibility_score\": 0.0\n"
+            "}\n\n"
+            "Return ONLY valid JSON."
+        )
+        return self._safe_json(self._ask_llm(prompt), fallback={})
+
     def _compose(self, topic: str, extracted: dict, sources: list) -> dict:
         findings = extracted.get("key_findings", [])
         metrics = extracted.get("metrics", [])
@@ -213,6 +356,57 @@ class V1Research:
             "problem_type": extracted.get("problem_type", "unknown"),
             "sources": sources[:10],
         }
+
+    def _build_research_memory(self, topic: str, sources: list) -> dict:
+        chunks = []
+        for idx, src in enumerate(sources):
+            snippet = (src.get("snippet") or "").strip()
+            if not snippet:
+                continue
+            chunks.append({
+                "source_index": idx,
+                "title": src.get("title", ""),
+                "url": src.get("url", ""),
+                "text": snippet,
+            })
+
+        if not chunks:
+            return {"query": topic, "chunks": []}
+
+        texts = [c["text"] for c in chunks]
+        scores, method = self._score_chunks(topic, texts)
+        for chunk, score in zip(chunks, scores):
+            chunk["score"] = float(score)
+
+        chunks.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        return {
+            "query": topic,
+            "method": method,
+            "chunks": chunks[:12],
+        }
+
+    def _score_chunks(self, query: str, texts: list) -> tuple[list, str]:
+        if not texts:
+            return [], "none"
+        try:
+            from sentence_transformers import SentenceTransformer
+            model = SentenceTransformer("all-MiniLM-L6-v2")
+            embeddings = model.encode([query] + texts, normalize_embeddings=True)
+            query_vec = embeddings[0]
+            doc_vecs = embeddings[1:]
+            scores = [float((query_vec @ vec)) for vec in doc_vecs]
+            return scores, "sentence_transformers"
+        except Exception:
+            try:
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                from sklearn.metrics.pairwise import cosine_similarity
+
+                vectorizer = TfidfVectorizer(stop_words="english")
+                matrix = vectorizer.fit_transform([query] + texts)
+                scores = cosine_similarity(matrix[0:1], matrix[1:]).flatten().tolist()
+                return scores, "tfidf"
+            except Exception:
+                return [0.0 for _ in texts], "none"
 
     def _detect_contradictions(self, findings: dict) -> list:
         """Numeric metric variance > 15% signals a contradiction."""

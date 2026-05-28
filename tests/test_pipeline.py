@@ -60,6 +60,7 @@ def test_v1_run_returns_expected_keys():
     with patch.object(v1, "_ask_llm", side_effect=[
         MOCK_LLM_QUERIES,   # query rewriting
         MOCK_LLM_FINDINGS,  # findings extraction
+        "{}",               # research blueprint
         "[]",               # semantic contradictions
     ]):
         with patch.object(v1, "_web_search", return_value=[]):
