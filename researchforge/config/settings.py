@@ -90,6 +90,10 @@ class Settings:
     def huggingface_token(self) -> str:
         return os.environ.get("HUGGINGFACE_TOKEN") or self._config.get("huggingface_token", "")
 
+    @property
+    def openai_api_key(self) -> str:
+        return os.environ.get("OPENAI_API_KEY") or self._config.get("openai_api_key", "")
+
     @classmethod
     def _load_existing_config(cls, config_path: Path) -> dict:
         if config_path.exists():
@@ -161,62 +165,41 @@ class Settings:
         graph_url = existing.get("graph_url", "")
         redis_url = existing.get("redis_url", "")
 
-        if not ollama_reachable:
-            print("\n  Ollama isn't running locally. Where should I get your DB connection details")
-            print("  (Postgres for evidence store, Neo4j/KuzuDB for the knowledge graph)?")
-            print("  You can (a) give me connection strings now, or (b) I can spin up")
-            print("  Postgres + Neo4j/KuzuDB + Redis via Docker Compose for you.")
-            choice = ""
-            while choice not in {"a", "b"}:
-                choice = input("  Choose [a/b]: ").strip().lower()
+        if kaggle_user:
+            kaggle_key = input(
+                f"  Kaggle API key [{existing.get('kaggle_key', '')}]: "
+            ).strip() or existing.get("kaggle_key", "")
+        else:
+            kaggle_key = ""
 
-            if choice == "a":
-                storage_mode = "manual"
-                postgres_url = cls._require_connection_detail("Postgres URL", postgres_url)
-                graph_url = cls._require_connection_detail("Graph URL or KuzuDB path", graph_url)
-                redis_url = cls._require_connection_detail("Redis URL", redis_url or DEFAULT_REDIS_URL)
-            else:
-                storage_mode = "docker_compose"
-                compose_path = Path.cwd() / "infra" / "docker-compose.yml"
-                cls._run_compose_stack(compose_path)
-                postgres_url = DEFAULT_POSTGRES_URL
-                graph_url = DEFAULT_GRAPH_URL
-                redis_url = DEFAULT_REDIS_URL
+        mlflow_uri = input(
+            f"  MLflow tracking URI [{existing.get('mlflow_tracking_uri', 'mlruns')}]: "
+        ).strip() or existing.get("mlflow_tracking_uri", "mlruns")
 
-            cls._write_runtime_env(
-                settings.runtime_env_path,
-                {
-                    "POSTGRES_URL": postgres_url,
-                    "GRAPH_URL": graph_url,
-                    "REDIS_URL": redis_url,
-                },
-            )
+        print("\n  Optional API integrations (press Enter to skip):")
 
-        llm_provider = cls._prompt_value(
-            "LLM provider (auto|ollama|openrouter)",
-            existing.get("llm_provider", "auto"),
-        )
-        model = cls._prompt_value("Default LLM model", existing.get("model", DEFAULT_LLM_MODEL))
-        openrouter_key = cls._prompt_value(
-            "OpenRouter API key (optional)",
-            existing.get("openrouter_api_key", ""),
-        )
+        tavily_key = input(
+            f"  Tavily API key [{existing.get('tavily_api_key', '')}]: "
+        ).strip() or existing.get("tavily_api_key", "")
+
+        hf_token = input(
+            f"  Hugging Face token [{existing.get('huggingface_token', '')}]: "
+        ).strip() or existing.get("huggingface_token", "")
+
+        openai_key = input(
+            f"  OpenAI API key [{existing.get('openai_api_key', '')}]: "
+        ).strip() or existing.get("openai_api_key", "")
 
         config = {
             "ollama_url": ollama_url,
             "llm_provider": llm_provider,
             "model": model,
-            "openrouter_api_key": openrouter_key,
-            "openrouter_base_url": existing.get("openrouter_base_url", DEFAULT_OPENROUTER_BASE_URL),
-            "storage_mode": storage_mode,
-            "postgres_url": postgres_url,
-            "graph_url": graph_url,
-            "redis_url": redis_url,
-            "kaggle_username": existing.get("kaggle_username", ""),
-            "kaggle_key": existing.get("kaggle_key", ""),
-            "mlflow_tracking_uri": existing.get("mlflow_tracking_uri", "mlruns"),
-            "tavily_api_key": existing.get("tavily_api_key", ""),
-            "huggingface_token": existing.get("huggingface_token", ""),
+            "kaggle_username": kaggle_user,
+            "kaggle_key": kaggle_key,
+            "mlflow_tracking_uri": mlflow_uri,
+            "tavily_api_key": tavily_key,
+            "huggingface_token": hf_token,
+            "openai_api_key": openai_key,
         }
 
         with open(settings.config_path, "w", encoding="utf-8") as handle:
