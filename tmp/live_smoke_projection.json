@@ -1,0 +1,63 @@
+{
+  "data": {
+    "nodes": [
+      {
+        "id": "http://arxiv.org/abs/1234.5678",
+        "label": "Paper",
+        "title": "Graph Models for Ticket Routing",
+        "source": "arxiv",
+        "published": "2026-01-02T00:00:00Z",
+        "query": "support ticket classification",
+        "provenance": {
+          "source": "http://arxiv.org/abs/1234.5678",
+          "retrieved_at": "2026-07-07T00:00:00+00:00",
+          "agent": "research"
+        }
+      },
+      {
+        "id": "author:alice",
+        "label": "Author",
+        "title": "Alice",
+        "source": "arxiv",
+        "published": "",
+        "query": "support ticket classification",
+        "provenance": {
+          "source": "http://arxiv.org/abs/1234.5678",
+          "retrieved_at": "2026-07-07T00:00:00+00:00",
+          "agent": "research"
+        }
+      },
+      {
+        "id": "https://github.com/openai/researchforge-demo",
+        "label": "Repository",
+        "title": "openai/researchforge-demo",
+        "source": "github",
+        "published": "2026-02-01T00:00:00Z",
+        "query": "support ticket classification",
+        "provenance": {
+          "source": "https://github.com/openai/researchforge-demo",
+          "retrieved_at": "2026-07-07T00:00:00+00:00",
+          "agent": "research"
+        }
+      }
+    ],
+    "edges": [
+      {
+        "type": "authored",
+        "from": "author:alice",
+        "to": "http://arxiv.org/abs/1234.5678",
+        "provenance": {
+          "source": "http://arxiv.org/abs/1234.5678",
+          "retrieved_at": "2026-07-07T00:00:00+00:00",
+          "agent": "research"
+        }
+      }
+    ]
+  },
+  "provenance": {
+    "source": "planner:fake",
+    "retrieved_at": "2026-07-07T00:00:00+00:00",
+    "agent": "knowledge_graph"
+  },
+  "confidence": "computed"
+}

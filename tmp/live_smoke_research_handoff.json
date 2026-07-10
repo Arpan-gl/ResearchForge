@@ -1,0 +1,47 @@
+{
+  "data": {
+    "queries": [
+      "support ticket classification"
+    ],
+    "evidence": [
+      {
+        "title": "Graph Models for Ticket Routing",
+        "url": "http://arxiv.org/abs/1234.5678",
+        "snippet": "Uses graph neural networks.",
+        "published": "2026-01-02T00:00:00Z",
+        "authors": [
+          "Alice"
+        ],
+        "source": "arxiv",
+        "query": "support ticket classification",
+        "provenance": {
+          "source": "http://arxiv.org/abs/1234.5678",
+          "retrieved_at": "2026-07-07T00:00:00+00:00",
+          "agent": "research"
+        }
+      },
+      {
+        "title": "openai/researchforge-demo",
+        "url": "https://github.com/openai/researchforge-demo",
+        "snippet": "Training pipeline reference implementation.",
+        "published": "2026-02-01T00:00:00Z",
+        "authors": [
+          "openai"
+        ],
+        "source": "github",
+        "query": "support ticket classification",
+        "provenance": {
+          "source": "https://github.com/openai/researchforge-demo",
+          "retrieved_at": "2026-07-07T00:00:00+00:00",
+          "agent": "research"
+        }
+      }
+    ]
+  },
+  "provenance": {
+    "source": "planner:fake",
+    "retrieved_at": "2026-07-07T00:00:00+00:00",
+    "agent": "research"
+  },
+  "confidence": "computed"
+}

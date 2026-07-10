@@ -1,9 +1,9 @@
-from setuptools import setup, find_packages
+﻿from setuptools import setup, find_packages
 
 setup(
     name="researchforge",
     version="0.1.0",
-    description="Topic to trained model — fully automated ML research pipeline",
+    description="Topic to trained model - fully automated ML research pipeline",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     author="ResearchForge",
@@ -23,6 +23,9 @@ setup(
         "joblib>=1.3",
         "matplotlib>=3.7",
         "seaborn>=0.12",
+        "psycopg[binary]>=3.2",
+        "lightning>=2.4",
+        "neo4j>=5.23",
     ],
     extras_require={
         "gnn": [
@@ -55,6 +58,8 @@ setup(
             "datasets>=2.14",
             "kaggle>=1.5",
             "mlflow>=2.8",
+            "lightning>=2.4",
+            "neo4j>=5.23",
         ],
     },
     entry_points={

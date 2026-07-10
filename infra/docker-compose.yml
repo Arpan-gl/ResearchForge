@@ -1,0 +1,49 @@
+﻿services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: researchforge-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: researchforge-postgres
+    environment:
+      POSTGRES_DB: researchforge
+      POSTGRES_USER: researchforge
+      POSTGRES_PASSWORD: researchforge
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: researchforge-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/researchforge
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: researchforge-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+  postgres_data:
+  neo4j_data:
+  redis_data:
