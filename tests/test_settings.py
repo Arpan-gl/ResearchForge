@@ -107,6 +107,16 @@ def test_init_wizard_prompts_for_manual_storage_when_ollama_unreachable():
                 "auto",
                 "qwen/qwen3-coder-next",
                 "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "mlruns",
+                "yes",
             ]
         )
 

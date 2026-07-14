@@ -4,7 +4,9 @@ This reconciles `ResearchForge_Master_Product_Specification.pdf` and
 `ResearchForge_Training_OS_System_Design.pdf` (both kept verbatim in `spec/` — see below) into one
 buildable architecture. Three changes from the original docs, per explicit decision:
 
-1. **Reasoning layer**: Gemini → **OpenRouter** (model-agnostic, swappable via env var).
+1. **Reasoning layer**: OpenRouter routes research queries, evidence summaries, and research
+   contradictions to `google/gemini-2.5-flash-lite`; it also provides the remote fallback for
+   general agent work.
 2. **Execution engine**: adds a **Karpathy-style minimal trainer** (nanoGPT/micrograd philosophy —
    a small, fully-readable, from-scratch training loop) as a first-class path, not just
    Lightning/Transformers/TRL. This is the path used when the task is "train/finetune a small
@@ -46,7 +48,7 @@ values, training code, or infra decisions. Those come from libraries, templates,
 CLI (researchforge)
   │
   ▼
-Intent Parser  ──────────────► OpenRouter (structured JSON output only)
+Intent Parser  ──────────────► Ollama when reachable, otherwise OpenRouter (structured JSON only)
   │
   ▼
 Parallel Evidence Search  ───► ArXiv / Semantic Scholar / OpenAlex / GitHub /
@@ -58,7 +60,7 @@ Evidence Store  ─────────────► Postgres (metadata) +
 Knowledge Graph  ────────────► Neo4j / KuzuDB (nodes: Paper, Dataset, Model, Task,
   │                             Metric, Benchmark, Repository, Author)
   ▼
-Reasoning Layer  ────────────► OpenRouter — synthesizes evidence into ranked,
+Reasoning Layer  ────────────► OpenRouter → Gemini 2.5 Flash Lite — synthesizes evidence into ranked,
   │                             cited recommendations. Never invents facts.
   ▼
 Dataset Validation  ─────────► Great Expectations / Pandera / Cleanlab / Polars+DuckDB
@@ -121,15 +123,15 @@ as the rest of the hallucination-prevention design.
 
 ## LLM Layer
 
-- All reasoning/intent calls go through **OpenRouter** (`OPENROUTER_API_KEY` env var), default
-  model `qwen/qwen3-coder-next` — chosen because it's an agentic/tool-use model, which matches
-  what every call in this system actually is (structured JSON output, config generation, tool
-  calls), not free-form chat. Model is still configurable per call via env var override
-  (e.g. a larger-context or thinking model for deep evidence synthesis, if 256k isn't enough).
-- Local Ollama is the **preferred default** for cost/latency on repeated calls (intent parsing,
-  dataset-strategy naming) — pull an equivalent local Qwen3-Coder weight if running fully offline;
-  OpenRouter (`qwen/qwen3-coder-next`) is the **fallback/production** path or used directly if the
-  user opts out of local.
+- OpenRouter (`OPENROUTER_API_KEY`) handles multi-source research query generation, evidence
+  summaries, and contradiction explanations with `google/gemini-2.5-flash-lite`. No direct Gemini
+  SDK or Google Gemini API key is used. The official OpenRouter Python SDK is used, with
+  `openrouter/free` as an explicit fallback only after a 402 billing response. It must never invent
+  retrieved facts or computed metrics.
+- General agent calls use local Ollama when reachable and fall back to OpenRouter
+  (`OPENROUTER_API_KEY`) when it is not. The default OpenRouter model remains
+  `qwen/qwen3-coder-next`.
+- Neither provider is ever used to generate dataset content, training code, or numeric results.
 - Neither is ever used to generate: dataset content, training code, or numeric results.
 
 ## Folder Structure

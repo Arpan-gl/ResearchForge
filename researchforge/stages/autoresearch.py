@@ -33,6 +33,7 @@ from pathlib import Path
 import nbformat
 from researchforge.config.settings import Settings
 from researchforge.utils.display import Display
+from researchforge.agents.planner.llm import LLMRouter
 
 
 class Autoresearch:
@@ -42,6 +43,7 @@ class Autoresearch:
         self.settings = Settings()
         self.ollama_url = self.settings.ollama_url
         self.model = self.settings.llm_model
+        self.llm_router = LLMRouter(self.settings)
         self.kernel_name = "python3"
 
     # ── Main entry point ──────────────────────────────────────────
@@ -964,11 +966,7 @@ class Autoresearch:
 
     def _ask_llm(self, prompt: str) -> str:
         try:
-            resp = requests.post(
-                f"{self.ollama_url}/api/generate",
-                json={"model": self.model, "prompt": prompt, "stream": False},
-                timeout=60,
-            )
-            return resp.json().get("response", "")
+            response, _provider = self.llm_router.generate_agent(prompt)
+            return response
         except Exception:
             return "{}"

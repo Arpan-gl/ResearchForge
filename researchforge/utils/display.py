@@ -4,6 +4,7 @@ Colors: cyan (info), amber (warn), green (success), red (error)
 """
 
 import json
+import sys
 from pathlib import Path
 
 
@@ -23,6 +24,11 @@ class Display:
 
     @staticmethod
     def banner():
+        # Windows consoles may use cp1252; replace unsupported glyphs instead of crashing.
+        try:
+            sys.stdout.reconfigure(errors="replace")
+        except (AttributeError, OSError):
+            pass
         print(f"\n{Colors.CYAN}{Colors.BOLD}")
         print("  ██████╗ ███████╗███████╗ █████╗ ██████╗  ██████╗██╗  ██╗")
         print("  ██╔══██╗██╔════╝██╔════╝██╔══██╗██╔══██╗██╔════╝██║  ██║")

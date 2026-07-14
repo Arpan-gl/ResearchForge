@@ -149,6 +149,20 @@ def test_discover_returns_no_dataset_sentinel_when_empty():
     assert result["score"] == 0.0
 
 
+def test_dataset_query_variants_cover_ipl_without_llm():
+    v = make_v2()
+    variants = v._dataset_query_variants("predict the IPL match winner")
+    assert "IPL cricket match winner" in variants
+    assert "Indian Premier League match results" in variants
+
+
+def test_dataset_query_variants_cover_fifa_without_llm():
+    v = make_v2()
+    variants = v._dataset_query_variants("train a model for fifa football world cup prediction")
+    assert "FIFA World Cup match results" in variants
+    assert "football world cup dataset" in variants
+
+
 def test_score_dataset_includes_confidence_and_rationale():
     v = make_v2()
     ds = {

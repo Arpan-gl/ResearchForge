@@ -6,9 +6,9 @@ code, read, in this order:
 1. `spec/ResearchForge_Master_Product_Specification.pdf` and
    `spec/ResearchForge_Training_OS_System_Design.pdf` — the original product specs.
 2. `docs/ARCHITECTURE.md` and `docs/AGENTS.md` — the rebuilt, buildable version of those specs,
-   with three explicit deviations called out at the top of ARCHITECTURE.md (OpenRouter instead of
-   Gemini, the added Karpathy-minimal training path, and `qwen/qwen3-coder-next` as the default
-   model).
+   with the provider split called out at the top of ARCHITECTURE.md (OpenRouter using Gemini 2.5 Flash Lite for research reasoning,
+   Ollama-first/OpenRouter-fallback for general agent work, the added Karpathy-minimal training
+   path, and `qwen/qwen3-coder-next` as the default remote model).
 
 The `docs/` files are the source of truth for anything they cover; the `spec/` PDFs are the source
 of truth for anything they don't. If you find a real conflict between them beyond the three known
@@ -28,7 +28,7 @@ the user instead of guessing.
 
 ## Hard constraints (non-negotiable, from ARCHITECTURE.md / AGENTS.md)
 
-- The LLM layer (OpenRouter, `OPENROUTER_API_KEY`) is used **only** for: intent parsing into
+- The LLM layer (OpenRouter using Gemini 2.5 Flash Lite for research reasoning; Ollama/OpenRouter for general agent work) is used **only** for: intent parsing into
   structured JSON, ranking/synthesizing already-retrieved evidence, choosing a validation strategy
   *name* from a fixed menu, proposing hyperparameters to search, and writing human-readable
   summaries/reports.
@@ -39,8 +39,9 @@ the user instead of guessing.
   reasoning traces, and do so via env var, not a hardcoded string.
 - The LLM **never**: invents a dataset, paper, or metric value; writes raw training code; decides
   DB/infra location on its own; touches actual data values during cleaning.
-- Prefer **local Ollama** for repeated/cheap calls (intent parsing, strategy naming). Use
-  **OpenRouter** as the default remote path and automatic fallback if Ollama is unreachable.
+- Use **OpenRouter** with `google/gemini-2.5-flash-lite` for multi-source research queries, evidence
+  summaries, and contradiction explanations. Use local **Ollama** for general agent calls when
+  reachable, with **OpenRouter** as the fallback.
 - Config generation (YAML/JSON) is the deliverable of the Training Planner — not code generation.
 - Training Execution Engine must support **two paths**:
   - `training/karpathy_minimal/` — a single, fully-readable, from-scratch training loop

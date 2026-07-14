@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus
 from researchforge.config.settings import Settings
+from researchforge.integrations.huggingface import HuggingFaceIntegration
 
 
 class V2Datasets:
@@ -22,6 +23,7 @@ class V2Datasets:
         self.settings = Settings()
         self.ollama_url = ollama_url or self.settings.ollama_url
         self.model = model or self.settings.llm_model
+        self.huggingface = HuggingFaceIntegration(self.settings.huggingface_token)
 
     # ── Query helpers ───────────────────────────────────────────
 
@@ -84,13 +86,30 @@ class V2Datasets:
         search_query = self.build_search_query(topic, search_context)
 
         candidates = []
-        candidates += self._search_kaggle(search_query)
-        candidates += self._search_huggingface(search_query)
+        # Search both the full evidence context and the user's shorter topic.
+        # Public catalog search works better with concise domain terms.
+        search_queries = self._dataset_query_variants(search_query)
+        for variant in self._dataset_query_variants(topic):
+            if variant.lower() not in {item.lower() for item in search_queries}:
+                search_queries.append(variant)
+        for candidate_query in search_queries:
+            candidates += self._search_kaggle(candidate_query)
+            candidates += self._search_huggingface(candidate_query)
+
+        seen = set()
+        unique_candidates = []
+        for candidate in candidates:
+            identity = candidate.get("url") or candidate.get("name") or candidate.get("title")
+            if identity and identity not in seen:
+                seen.add(identity)
+                unique_candidates.append(candidate)
+        candidates = unique_candidates
 
         if not candidates:
             return {
                 "datasets": [],
                 "search_query": search_query,
+                "search_queries": search_queries,
                 "search_urls": self._build_search_urls(search_query),
             }
 
@@ -99,8 +118,33 @@ class V2Datasets:
         return {
             "datasets": scored[:5],
             "search_query": search_query,
+            "search_queries": search_queries,
             "search_urls": self._build_search_urls(search_query),
         }
+
+    def _dataset_query_variants(self, query: str) -> list[str]:
+        """Create deterministic search variants without asking an LLM to invent terms."""
+        variants = [query, f"{query} dataset"]
+        lowered = query.lower()
+        if "ipl" in lowered or "indian premier league" in lowered or "cricket" in lowered:
+            variants.extend(["IPL cricket match winner", "Indian Premier League match results"])
+        if any(term in lowered for term in ("fifa", "football", "soccer", "world cup")):
+            variants.extend([
+                "FIFA World Cup match results",
+                "football world cup dataset",
+                "football match winner dataset",
+            ])
+        if "winner" in lowered or "winning" in lowered:
+            variants.append("cricket match winner dataset")
+
+        unique = []
+        seen = set()
+        for variant in variants:
+            normalized = self._normalize_text(variant)
+            if normalized and normalized.lower() not in seen:
+                seen.add(normalized.lower())
+                unique.append(normalized)
+        return unique
 
     def audit(self, df, topic: str, v1_findings: dict) -> dict:
         """Audit a loaded dataframe for quality risks."""
@@ -185,7 +229,88 @@ class V2Datasets:
         best["related_papers"] = self._get_arxiv_papers(
             discovered.get("search_query") or topic
         )
+        if self._sft_requested(topic, v1_findings):
+            best["model_candidates"] = self.search_huggingface_models(topic)
+            best["sft_suggestion"] = self.suggest_supervised_finetuning(
+                topic, best, best["model_candidates"], v1_findings
+            )
         return best
+
+    @staticmethod
+    def _sft_requested(topic: str, v1_findings: dict) -> bool:
+        text = f"{topic} {v1_findings.get('modality', '')}".lower()
+        return any(term in text for term in ("fine tune", "fine-tune", "finetune", "sft", "language model", "nlp"))
+
+    def search_huggingface_models(self, query: str, limit: int = 5) -> list[dict]:
+        return self.huggingface.search_models(query, limit=limit)
+
+    def suggest_supervised_finetuning(self, topic: str, dataset: dict, models: list[dict], findings: dict) -> dict:
+        """Ask Gemini for a validated SFT plan, never executable training code."""
+        from researchforge.agents.planner.llm import LLMRouter
+
+        schema = {
+            "applicable": False,
+            "reason": "",
+            "base_model": "",
+            "dataset_id": dataset.get("id") or dataset.get("name", ""),
+            "task_type": findings.get("problem_type", "unknown"),
+            "text_column": "",
+            "label_column": dataset.get("label_column", ""),
+            "max_seq_length": 512,
+            "learning_rate": 2e-5,
+            "batch_size": 8,
+            "epochs": 3,
+            "evaluation_strategy": "epoch",
+            "metric": "",
+            "notes": [],
+        }
+        prompt = (
+            "Return JSON only. Recommend supervised fine-tuning only if appropriate for the dataset and task. "
+            "Do not write Python, shell commands, or training code. If this is tabular classification, set "
+            "applicable=false and explain why. Use only the supplied metadata; do not invent columns. "
+            f"Topic: {topic}\nDataset metadata: {json.dumps(dataset, default=str)[:5000]}\n"
+            f"Candidate models: {json.dumps(models, default=str)[:4000]}\nFindings: {json.dumps(findings, default=str)[:3000]}\n"
+            f"Required keys: {', '.join(schema)}"
+        )
+        try:
+            raw, provider = LLMRouter(self.settings).generate_research(prompt)
+            suggestion = LLMRouter._load_json(raw)
+            result = {**schema, **suggestion}
+            result["applicable"] = bool(result["applicable"])
+            valid_model_ids = {item.get("id") for item in models if item.get("id")}
+            if result["base_model"] not in valid_model_ids:
+                result["base_model"] = ""
+            known_columns = set(dataset.get("columns") or [])
+            if known_columns:
+                if result["text_column"] not in known_columns:
+                    result["text_column"] = ""
+                if result["label_column"] not in known_columns:
+                    result["label_column"] = ""
+            else:
+                result["text_column"] = ""
+                result["label_column"] = ""
+            result["max_seq_length"] = max(64, min(int(result["max_seq_length"]), 4096))
+            result["batch_size"] = max(1, min(int(result["batch_size"]), 128))
+            result["epochs"] = max(1, min(int(result["epochs"]), 20))
+            result["learning_rate"] = max(1e-7, min(float(result["learning_rate"]), 1e-2))
+            result["notes"] = result["notes"] if isinstance(result["notes"], list) else [str(result["notes"])]
+            result["provenance"] = {
+                "source": f"openrouter:{self.settings.research_model}" if provider == "openrouter:gemini" else "openrouter:free",
+                "retrieved_at": datetime.now().astimezone().isoformat(),
+                "agent": "training_planner",
+            }
+            result["confidence"] = "llm_summarized"
+            return result
+        except Exception as exc:
+            schema["reason"] = f"Gemini recommendation unavailable: {exc}"
+            schema["notes"] = ["No executable training code was generated."]
+            schema["provenance"] = {
+                "source": "sft-fallback",
+                "retrieved_at": datetime.now().astimezone().isoformat(),
+                "agent": "training_planner",
+            }
+            schema["confidence"] = "computed"
+            return schema
 
     # ── Private: search backends ──────────────────────────────────
 
@@ -209,6 +334,10 @@ class V2Datasets:
             return []
 
     def _search_huggingface(self, topic: str) -> list:
+        try:
+            return self.huggingface.search_datasets(topic, limit=5)
+        except Exception:
+            return self._search_huggingface_http(topic)
         """HuggingFace Datasets API — free, no auth."""
         try:
             from huggingface_hub import HfApi
@@ -305,6 +434,15 @@ class V2Datasets:
             local_dir = os.path.join(output_dir, safe_name)
             os.makedirs(local_dir, exist_ok=True)
             return snapshot_download(repo_id=repo_id, repo_type="dataset", local_dir=local_dir)
+        except Exception:
+            return None
+
+    def download_hf_model(self, repo_id: str, output_dir: str = "outputs/models/huggingface") -> str | None:
+        """Physically download a selected Hugging Face model snapshot."""
+        if not repo_id:
+            return None
+        try:
+            return self.huggingface.download_model(repo_id, output_dir)
         except Exception:
             return None
 

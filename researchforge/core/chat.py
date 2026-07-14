@@ -5,6 +5,7 @@ Knows about ResearchForge pipeline context
 
 import requests
 from researchforge.config.settings import Settings
+from researchforge.agents.planner.llm import LLMRouter
 from researchforge.utils.state import load_state
 
 
@@ -13,6 +14,7 @@ class ChatSession:
         self.settings = Settings()
         self.ollama_url = self.settings.ollama_url
         self.model = self.settings.llm_model
+        self.llm_router = LLMRouter(self.settings)
         self.history = []
         self.system_prompt = (
             "You are ResearchForge Assistant, an expert in ML research, "
@@ -72,19 +74,9 @@ class ChatSession:
         conversation += "Assistant:"
 
         try:
-            resp = requests.post(
-                f"{self.ollama_url}/api/generate",
-                json={"model": self.model, "prompt": conversation, "stream": False},
-                timeout=60
-            )
-            reply = resp.json().get(
-                "response",
-                "Sorry, could not reach Ollama. Is it running?"
-            ).strip()
+            reply, _provider = self.llm_router.generate_agent(conversation)
+            reply = reply.strip()
             self.history.append({"role": "assistant", "content": reply})
             return reply
         except Exception:
-            return (
-                f"Could not reach Ollama at {self.ollama_url}. "
-                "Make sure it's running: `ollama serve`"
-            )
+            return "No chat LLM is available. Start Ollama or configure OPENROUTER_API_KEY."

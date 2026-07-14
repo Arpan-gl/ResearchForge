@@ -11,6 +11,7 @@ setup(
     python_requires=">=3.9",
     install_requires=[
         "requests>=2.31",
+        "openrouter>=0.11.30",
         "pandas>=2.0",
         "numpy>=1.24",
         "scikit-learn>=1.3",

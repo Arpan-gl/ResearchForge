@@ -125,7 +125,8 @@ class Pipeline:
             )
             results["v3"] = v3_result
             Display.success(f"Notebook: {v3_result['notebook_path']}")
-            Display.info(f"Model: {v3_result['model']}  ·  Expected {v3_result['metric_name']}: {v3_result['expected_range']}")
+            Display.info(f"Model: {v3_result['model']}  ·  {v3_result['metric_name']}: {v3_result['expected_range']}")
+            Display.info(f"Model strategy provider: {v3_result.get('model_strategy_provider', 'deterministic')}")
             if v3_result.get("model_package_dir"):
                 Display.info(f"Model package: {v3_result['model_package_dir']}")
 

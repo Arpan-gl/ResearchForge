@@ -35,6 +35,14 @@ def test_rewrite_queries_fallback_on_bad_json():
     assert len(result) == 4
 
 
+def test_rewrite_queries_uses_deterministic_ipl_fallback():
+    v = make_v1()
+    with patch.object(v, "_ask_llm", return_value='{"error": "provider unavailable"}'):
+        result = v._rewrite_queries("predict the IPL match winner")
+    assert result[0] == "IPL cricket match winner prediction"
+    assert len(result) == 4
+
+
 def test_rewrite_queries_strips_markdown_fences():
     v = make_v1()
     fenced = '```json\n["a","b","c","d"]\n```'
@@ -139,3 +147,15 @@ def test_extract_findings_fallback_on_unparseable():
     assert "key_findings" in result
     assert isinstance(result["key_findings"], list)
     assert "problem_type" in result
+
+
+def test_deterministic_extraction_preserves_source_evidence():
+    v = make_v1()
+    v._research_llm_error = "HTTP 402 Client Error"
+    result = v._deterministic_extraction(
+        "predict the IPL match winner",
+        [{"title": "IPL results", "snippet": "Retrieved match records", "url": "https://example.test/ipl"}],
+    )
+    assert result["key_findings"] == ["[1] IPL results: Retrieved match records"]
+    assert result["problem_type"] == "classification"
+    assert result["limitations"]

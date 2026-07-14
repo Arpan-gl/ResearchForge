@@ -4,8 +4,9 @@ Eight agents, each with a narrow job and a hard boundary on what it's allowed to
 must retrieve/compute deterministically. Every agent writes its output plus a provenance record
 before handing off — the next agent refuses to run on unprovenanced input.
 
-**Default LLM for every agent below**: OpenRouter, model `qwen/qwen3-coder-next` (via local Ollama
-first if available). Any agent-level LLM call not otherwise noted uses this model. Source specs
+**Provider routing**: OpenRouter routes research query generation, evidence summaries, and
+contradiction explanations to `google/gemini-2.5-flash-lite`. General agent calls use local Ollama
+first and OpenRouter with model `qwen/qwen3-coder-next` when Ollama is unavailable. Source specs
 for this whole system live at `spec/ResearchForge_Master_Product_Specification.pdf` and
 `spec/ResearchForge_Training_OS_System_Design.pdf`.
 
@@ -13,7 +14,7 @@ for this whole system live at `spec/ResearchForge_Master_Product_Specification.p
 
 ### 1. Planner Agent
 - **Input**: raw user prompt (natural language research/training goal)
-- **Does**: calls OpenRouter to extract structured intent JSON — objective, task type, modality,
+- **Does**: calls the general agent router to extract structured intent JSON — objective, task type, modality,
   labels, eval metric, constraints, GPU availability, framework preference, expected output.
 - **Must NOT**: guess datasets, models, or metrics not stated or implied by the user — if unclear,
   emit `needs_clarification` and stop.
@@ -21,7 +22,7 @@ for this whole system live at `spec/ResearchForge_Master_Product_Specification.p
 
 ### 2. Research Agent
 - **Input**: `intent.json`
-- **Does**: parallel calls to ArXiv, Semantic Scholar, OpenAlex, CrossRef, GitHub,
+- **Does**: OpenRouter using Gemini 2.5 Flash Lite builds research queries and summarizes results around parallel calls to ArXiv, Semantic Scholar, OpenAlex, CrossRef, GitHub,
   PapersWithCode, Hugging Face, Kaggle, OpenML, Google Dataset Search. Merges + dedupes.
 - **Must NOT**: fabricate a paper, dataset, or stat that didn't come back from an API.
 - **Output**: `evidence/*.json` (raw), written into Postgres + object storage with source URL and
@@ -73,7 +74,7 @@ for this whole system live at `spec/ResearchForge_Master_Product_Specification.p
 
 ### 8. Reporting Agent (incl. AutoResearch loop)
 - **Input**: all prior outputs
-- **Does**: OpenRouter drafts a human-readable report/paper from the computed results and cited
+- **Does**: OpenRouter using Gemini 2.5 Flash Lite drafts a human-readable research summary from the computed results and cited
   evidence. AutoResearch mode re-runs Research Agent on a schedule, flags new relevant papers, and
   proposes new experiments — each proposal must cite the paper/evidence that motivated it.
 - **Must NOT**: state a result, comparison, or claim not backed by a prior agent's output.

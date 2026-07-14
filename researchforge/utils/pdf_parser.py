@@ -26,13 +26,16 @@ def parse_pdf_bytes(content: bytes) -> Tuple[str, List[str], str | None]:
 
     try:
         doc = fitz.open(stream=content, filetype="pdf")
-        pages_text = []
-        for page in doc:
-            try:
-                pages_text.append(page.get_text("text"))
-            except Exception:
-                pages_text.append("")
-        text = "\n".join(pages_text)
+        try:
+            pages_text = []
+            for page in doc:
+                try:
+                    pages_text.append(page.get_text("text"))
+                except Exception:
+                    pages_text.append("")
+            text = "\n".join(pages_text)
+        finally:
+            doc.close()
     except Exception as e:
         # If fitz fails, try OCR below
         text = ""

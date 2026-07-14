@@ -42,17 +42,21 @@ class V3Notebook:
         dataset_candidates = self._build_dataset_candidates(v2_dataset, dataset_name)
 
         model_name, model_reason = self._select_model(problem_type, v2_dataset, model_override)
+        model_name, model_reason, model_strategy_provider = self._review_model_strategy(
+            topic, problem_type, v2_dataset, model_name, model_reason, model_override
+        )
         metric_name, expected_range = self._expected_metrics(problem_type, model_name)
 
         nb = new_notebook()
         nb.cells = [
             self._title_cell(topic, model_name, model_reason),
-            self._data_loading_cell(dataset_candidates, label_col),
+            self._data_loading_cell(dataset_candidates, label_col, topic),
             self._eda_cell(),
             self._preprocessing_cell(),
             self._model_cell(problem_type, model_name),
             self._training_cell(problem_type),
             self._evaluation_cell(problem_type, metric_name),
+            self._future_prediction_cell(),
             self._summary_cell(topic, model_name, model_reason, v1_findings),
         ]
 
@@ -75,6 +79,7 @@ class V3Notebook:
             "notebook_path": nb_path,
             "model": model_name,
             "model_reason": model_reason,
+            "model_strategy_provider": model_strategy_provider,
             "metric_name": metric_name,
             "expected_range": expected_range,
             "problem_type": problem_type,
@@ -119,6 +124,50 @@ class V3Notebook:
             return "XGBoost", "Small dataset: robust baseline with strong bias/variance tradeoff"
         return "LightGBM", "Efficient for medium-to-large structured datasets"
 
+    def _review_model_strategy(
+        self,
+        topic: str,
+        problem_type: str,
+        v2_dataset: dict,
+        selected_model: str,
+        reason: str,
+        model_override: str = None,
+    ) -> tuple[str, str, str]:
+        """Let the general agent review strategy naming, never generate code."""
+        if model_override or not isinstance(getattr(self, "settings", None), Settings):
+            return selected_model, reason, "deterministic"
+
+        allowed = {"XGBoost", "LightGBM", "LightGBMRegressor", "RandomForest", "DistilBERT", "GATConv"}
+        prompt = (
+            "Return JSON only with keys model and reason. Choose one model from this fixed list: "
+            f"{sorted(allowed)}. Do not write code or invent metrics. Review the deterministic strategy.\n"
+            f"Topic: {topic}\nProblem type: {problem_type}\nDataset metadata: {json.dumps(v2_dataset, default=str)[:3000]}\n"
+            f"Current strategy: {selected_model} — {reason}"
+        )
+        try:
+            from researchforge.agents.planner.llm import LLMRouter
+
+            raw, provider = LLMRouter(self.settings).generate_agent(prompt)
+            proposal = LLMRouter._load_json(raw)
+            provider_label = provider
+            if provider in {"ollama", "openrouter"}:
+                provider_label = f"{provider}:{self.settings.llm_model}"
+            proposed_model = proposal.get("model")
+            if proposed_model not in allowed:
+                return selected_model, reason, f"{provider_label}:invalid_proposal"
+            compatible = {
+                "classification": {"XGBoost", "LightGBM", "RandomForest"},
+                "regression": {"LightGBMRegressor"},
+                "nlp": {"DistilBERT"},
+                "graph": {"GATConv"},
+            }
+            if proposed_model not in compatible.get(problem_type, allowed):
+                return selected_model, reason, f"{provider_label}:incompatible_proposal"
+            proposed_reason = str(proposal.get("reason") or reason).strip()
+            return proposed_model, proposed_reason, provider_label
+        except Exception:
+            return selected_model, reason, "deterministic:fallback"
+
     def _parse_rows(self, shape_str: str) -> int:
         try:
             return int(shape_str.split("rows")[0].replace(",", "").strip())
@@ -127,12 +176,12 @@ class V3Notebook:
 
     def _expected_metrics(self, problem_type: str, model: str):
         defaults = {
-            "classification": ("F1-macro", "0.78-0.86"),
-            "regression": ("RMSE", "model-dependent"),
-            "graph": ("F1-macro", "0.71-0.82"),
-            "nlp": ("Accuracy", "0.82-0.90"),
+            "classification": ("F1-macro", "measured after execution"),
+            "regression": ("RMSE", "measured after execution"),
+            "graph": ("F1-macro", "measured after execution"),
+            "nlp": ("Accuracy", "measured after execution"),
         }
-        return defaults.get(problem_type, ("F1-macro", "0.75-0.85"))
+        return defaults.get(problem_type, ("F1-macro", "measured after execution"))
 
     def _title_cell(self, topic, model, reason):
         return new_markdown_cell(
@@ -143,7 +192,7 @@ class V3Notebook:
             "This notebook is auto-generated. Review before running.\n"
         )
 
-    def _data_loading_cell(self, dataset_candidates, label_col):
+    def _data_loading_cell(self, dataset_candidates, label_col, topic=""):
         candidates_literal = json.dumps(dataset_candidates)
         requested_label = json.dumps(label_col)
         return new_code_cell(f"""\
@@ -154,9 +203,13 @@ import os
 import tempfile
 import glob
 from pathlib import Path
+import numpy as np
+import re
 
 DATASET_CANDIDATES = {candidates_literal}
 REQUESTED_LABEL = {requested_label}
+DATASET_TOPIC = {json.dumps(topic)}
+DATASET_ROOT = None
 
 
 def _maybe_download_kaggle_dataset(dataset_ref: str):
@@ -167,14 +220,36 @@ def _maybe_download_kaggle_dataset(dataset_ref: str):
         return None
 
     try:
+        global DATASET_ROOT
         tmp_dir = tempfile.mkdtemp(prefix="rf_kaggle_nb_")
+        DATASET_ROOT = tmp_dir
         kaggle.api.dataset_download_files(dataset_ref, path=tmp_dir, unzip=True)
         csv_files = glob.glob(os.path.join(tmp_dir, "**", "*.csv"), recursive=True)
         parquet_files = glob.glob(os.path.join(tmp_dir, "**", "*.parquet"), recursive=True)
         all_files = csv_files + parquet_files
         if all_files:
-            print(f"Downloaded Kaggle dataset '{{dataset_ref}}' to '{{tmp_dir}}'")
-            return all_files[0]
+            def file_score(path):
+                name = os.path.basename(path).lower()
+                score = 0
+                if "match" in name:
+                    score += 5
+                if "ranking" in name:
+                    score -= 4
+                if "schedule" in name:
+                    score -= 3
+                if "world_cup" in name and "match" not in name:
+                    score -= 2
+                try:
+                    columns = set(pd.read_csv(path, nrows=0).columns) if path.endswith(".csv") else set()
+                    if {{"home_team", "away_team", "home_score", "away_score"}}.issubset(columns):
+                        score += 20
+                except Exception:
+                    pass
+                return score
+
+            selected = max(all_files, key=file_score)
+            print(f"Downloaded Kaggle dataset '{{dataset_ref}}'; selected '{{os.path.basename(selected)}}'")
+            return selected
     except Exception as e:
         print(f"Kaggle download failed for '{{dataset_ref}}': {{e}}")
     return None
@@ -235,6 +310,17 @@ if DATASET_PATH.lower().endswith(".parquet"):
 else:
     df = pd.read_csv(DATASET_PATH)
 
+# For match prediction, derive the label from completed match scores and avoid
+# treating a ranking table's final numeric column as a supervised target.
+if {{"home_score", "away_score"}}.issubset(df.columns):
+    df = df.dropna(subset=["home_score", "away_score"]).copy()
+    df["match_result"] = np.select(
+        [df["home_score"] > df["away_score"], df["home_score"] < df["away_score"]],
+        ["home_win", "away_win"],
+        default="draw",
+    )
+    REQUESTED_LABEL = "match_result"
+
 target_hints = [
     "target", "label", "class", "y", "output", "result", "outcome", "made", "shot"
 ]
@@ -246,7 +332,10 @@ else:
     if hinted_cols:
         TARGET_COL = hinted_cols[0]
     else:
-        TARGET_COL = df.columns[-1]
+        raise ValueError(
+            f"Could not identify a supervised label. Requested '{{REQUESTED_LABEL}}'; "
+            "provide a target/label column or use match data with scores."
+        )
     print(f"Requested label '{{REQUESTED_LABEL}}' not found. Using '{{TARGET_COL}}' instead.")
 
 print(f"Dataset path: {{DATASET_PATH}}")
@@ -276,38 +365,51 @@ if TARGET_COL in df.columns:
         return new_code_cell(f"""\
 # Preprocessing
 
-from sklearn.model_selection import train_test_split
+# Split chronologically below instead of using a random holdout.
 from sklearn.preprocessing import LabelEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 import numpy as np
 
-# Drop likely ID columns
-df = df[[col for col in df.columns if \"id\" not in col.lower()]]
+# Remove identifiers and post-match fields that would leak the answer.
+leakage_terms = (\"score\", \"xg\", \"goal\", \"penalty\", \"red_card\", \"yellow\", \"own_goal\", \"referee\", \"official\", \"notes\", \"attendance\", \"captain\", \"manager\")
+drop_cols = [col for col in df.columns if col != TARGET_COL and (\"id\" in col.lower() or any(term in col.lower() for term in leakage_terms))]
+df = df.drop(columns=drop_cols, errors=\"ignore\")
 
 X = df.drop(columns=[TARGET_COL])
 y = df[TARGET_COL]
 
-# Encode categorical features conservatively
-for col in X.select_dtypes(include=[\"object\"]).columns:
-    if X[col].nunique() < 50:
-        le = LabelEncoder()
-        X[col] = le.fit_transform(X[col].astype(str))
-    else:
-        X = X.drop(columns=[col])
+# Encode labels from training data only.
+label_encoder = LabelEncoder()
+y = label_encoder.fit_transform(y.astype(str))
 
-num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+# Hold out the latest year. Random splits leak tournament-era information into
+# a forecast of a future competition.
+if \"Year\" in df.columns and df[\"Year\"].nunique() >= 2:
+    test_year = df[\"Year\"].max()
+    train_mask = df[\"Year\"] < test_year
+    test_mask = df[\"Year\"] == test_year
+else:
+    split_at = max(1, int(len(X) * 0.8))
+    order = np.arange(len(X))
+    train_mask = order < split_at
+    test_mask = order >= split_at
+
+X = pd.get_dummies(X, dummy_na=True)
+X.columns = [re.sub(r"[\\[\\]<>]", "_", str(col)) for col in X.columns]
+X_train, X_test = X.loc[train_mask].copy(), X.loc[test_mask].copy()
+y_train, y_test = y[train_mask], y[test_mask]
+X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
+
+num_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
 if num_cols:
     imputer = SimpleImputer(strategy=\"median\")
     scaler = StandardScaler()
-    X[num_cols] = scaler.fit_transform(imputer.fit_transform(X[num_cols]))
+    X_train[num_cols] = scaler.fit_transform(imputer.fit_transform(X_train[num_cols]))
+    X_test[num_cols] = scaler.transform(imputer.transform(X_test[num_cols]))
 
-X = X.fillna(0)
-
-stratify_arg = y if y.nunique() < 20 else None
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42, stratify=stratify_arg
-)
+print(f\"Temporal holdout year: {{test_year if 'test_year' in locals() else 'ordered holdout'}}\")
+print(f\"Train rows: {{len(X_train)}}; test rows: {{len(X_test)}}\")
 """)
 
     def _model_cell(self, problem_type, model_name):
@@ -426,6 +528,34 @@ print(classification_report(y_test, preds))
 print("{metric_name}:", f1_score(y_test, preds, average=\"macro\"))
 """)
 
+    def _future_prediction_cell(self):
+        return new_code_cell("""\
+# Future schedule predictions (if the downloaded dataset provides one)
+
+from pathlib import Path
+
+schedule_files = sorted(Path(DATASET_ROOT).glob("*schedule*.csv")) if DATASET_ROOT else []
+if schedule_files:
+    future = pd.read_csv(schedule_files[-1])
+    future_display = future[["home_team", "away_team"]].copy()
+    feature_drop = [
+        col for col in future.columns
+        if "id" in col.lower() or any(term in col.lower() for term in leakage_terms)
+    ]
+    future = future.drop(columns=feature_drop, errors="ignore")
+    future = pd.get_dummies(future, dummy_na=True)
+    future.columns = [re.sub(r"[\\[\\]<>]", "_", str(col)) for col in future.columns]
+    future = future.reindex(columns=X_train.columns, fill_value=0)
+    future_num = [col for col in num_cols if col in future.columns]
+    if future_num:
+        future[future_num] = scaler.transform(imputer.transform(future[future_num]))
+    future_display["predicted_result"] = label_encoder.inverse_transform(model.predict(future))
+    print("Future schedule predictions:")
+    display(future_display)
+else:
+    print("No future schedule file was provided; no future predictions were generated.")
+""")
+
     def _summary_cell(self, topic, model, reason, v1_findings):
         return new_code_cell(f"""\
 # Summary
@@ -541,6 +671,107 @@ print(json.dumps(summary, indent=2))
             + "\n".join(f"  {line}" for line in blueprint.splitlines())
             + "\n"
         )
+        return f"""import os
+import json
+import glob
+import re
+import tempfile
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import f1_score, mean_squared_error
+import joblib
+import yaml
+from model import build_model
+
+def _load_config(path='config.yaml'):
+    if not os.path.exists(path):
+        return {{}}
+    with open(path, 'r', encoding='utf-8') as f:
+        return yaml.safe_load(f) or {{}}
+
+cfg = _load_config()
+train_cfg = cfg.get('training', {{}})
+params = {{
+    'learning_rate': train_cfg.get('learning_rate', 0.1),
+    'n_estimators': int(train_cfg.get('n_estimators', 200)),
+    'max_depth': int(train_cfg.get('max_depth', 6)),
+}}
+DATASET_PATH = os.getenv('RF_DATASET_PATH', {first_candidate!r})
+TARGET_COL = os.getenv('RF_TARGET_COL', {label_col!r})
+
+if not os.path.exists(DATASET_PATH) and '/' in DATASET_PATH:
+    import kaggle
+    tmp_dir = tempfile.mkdtemp(prefix='rf_kaggle_train_')
+    kaggle.api.dataset_download_files(DATASET_PATH, path=tmp_dir, unzip=True)
+    files = glob.glob(os.path.join(tmp_dir, '**', '*.csv'), recursive=True)
+    if not files:
+        raise FileNotFoundError('Kaggle dataset did not contain a CSV file')
+    def _score_file(path):
+        cols = set(pd.read_csv(path, nrows=0).columns)
+        return 20 if {{'home_team', 'away_team', 'home_score', 'away_score'}}.issubset(cols) else 0
+    DATASET_PATH = max(files, key=_score_file)
+
+df = pd.read_csv(DATASET_PATH)
+if {{'home_score', 'away_score'}}.issubset(df.columns):
+    df = df.dropna(subset=['home_score', 'away_score']).copy()
+    df['match_result'] = np.select(
+        [df['home_score'] > df['away_score'], df['home_score'] < df['away_score']],
+        ['home_win', 'away_win'], default='draw')
+    TARGET_COL = 'match_result'
+elif TARGET_COL not in df.columns:
+    raise ValueError(f'No supervised label found: {{TARGET_COL}}')
+
+leakage_terms = ('score', 'xg', 'goal', 'penalty', 'red_card', 'yellow', 'own_goal', 'referee', 'official', 'notes', 'attendance', 'captain', 'manager')
+df = df.drop(columns=[c for c in df.columns if c != TARGET_COL and ('id' in c.lower() or any(t in c.lower() for t in leakage_terms))], errors='ignore')
+X = df.drop(columns=[TARGET_COL])
+y = LabelEncoder().fit_transform(df[TARGET_COL].astype(str))
+if 'Year' in df.columns and df['Year'].nunique() >= 2:
+    test_year = df['Year'].max()
+    train_mask, test_mask = df['Year'] < test_year, df['Year'] == test_year
+else:
+    split_at = max(1, int(len(X) * 0.8))
+    train_mask = np.arange(len(X)) < split_at
+    test_mask = ~train_mask
+X = pd.get_dummies(X, dummy_na=True)
+X.columns = [re.sub(r'[\\[\\]<>]', '_', str(c)) for c in X.columns]
+X_train, X_test = X.loc[train_mask].copy(), X.loc[test_mask].copy()
+y_train, y_test = y[train_mask], y[test_mask]
+X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
+num_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
+if num_cols:
+    imputer, scaler = SimpleImputer(strategy='median'), StandardScaler()
+    X_train[num_cols] = scaler.fit_transform(imputer.fit_transform(X_train[num_cols]))
+    X_test[num_cols] = scaler.transform(imputer.transform(X_test[num_cols]))
+params['random_state'] = int(os.getenv('RF_SEED', '42'))
+model = build_model(**params)
+model.fit(X_train, y_train)
+preds = model.predict(X_test)
+metrics = {{'f1_macro': float(f1_score(y_test, preds, average='macro'))}}
+joblib.dump(model, 'model.joblib')
+with open('metrics.json', 'w', encoding='utf-8') as f:
+    json.dump(metrics, f, indent=2)
+print(metrics)
+"""
+        return (
+            f"topic: {topic}\n"
+            f"problem_type: {problem_type}\n"
+            f"model: {model_name}\n"
+            f"dataset_candidates: [{candidates}]\n"
+            f"label_column: {label_col}\n"
+            f"source_dataset: {v2_dataset.get('name', '')}\n"
+            "training:\n"
+            "  epochs: 3\n"
+            "  batch_size: 32\n"
+            "  learning_rate: 0.1\n"
+            "  n_estimators: 200\n"
+            "  max_depth: 6\n"
+            "research_blueprint: |\n"
+            + "\n".join(f"  {line}" for line in blueprint.splitlines())
+            + "\n"
+        )
 
     def _model_py_text(self, problem_type: str, model_name: str) -> str:
         if problem_type == "nlp" or model_name == "DistilBERT":
@@ -601,6 +832,64 @@ print(json.dumps(summary, indent=2))
         label_col: str,
     ) -> str:
         first_candidate = dataset_candidates[0] if dataset_candidates else "dataset.csv"
+        if problem_type != "nlp" and model_name != "DistilBERT":
+            return f"""import os
+import json
+import glob
+import re
+import tempfile
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import f1_score
+import joblib
+import yaml
+from model import build_model
+
+with open('config.yaml', 'r', encoding='utf-8') as f:
+    cfg = yaml.safe_load(f) or {{}}
+train_cfg = cfg.get('training', {{}})
+params = {{'learning_rate': train_cfg.get('learning_rate', 0.1), 'n_estimators': int(train_cfg.get('n_estimators', 200)), 'max_depth': int(train_cfg.get('max_depth', 6))}}
+DATASET_PATH = os.getenv('RF_DATASET_PATH', {first_candidate!r})
+TARGET_COL = os.getenv('RF_TARGET_COL', {label_col!r})
+if not os.path.exists(DATASET_PATH) and '/' in DATASET_PATH:
+    import kaggle
+    tmp_dir = tempfile.mkdtemp(prefix='rf_kaggle_train_')
+    kaggle.api.dataset_download_files(DATASET_PATH, path=tmp_dir, unzip=True)
+    files = glob.glob(os.path.join(tmp_dir, '**', '*.csv'), recursive=True)
+    DATASET_PATH = max(files, key=lambda p: 20 if {{'home_team', 'away_team', 'home_score', 'away_score'}}.issubset(set(pd.read_csv(p, nrows=0).columns)) else 0)
+df = pd.read_csv(DATASET_PATH)
+if {{'home_score', 'away_score'}}.issubset(df.columns):
+    df = df.dropna(subset=['home_score', 'away_score']).copy()
+    df['match_result'] = np.select([df['home_score'] > df['away_score'], df['home_score'] < df['away_score']], ['home_win', 'away_win'], default='draw')
+    TARGET_COL = 'match_result'
+elif TARGET_COL not in df.columns:
+    raise ValueError(f'No supervised label found: {{TARGET_COL}}')
+leakage_terms = ('score', 'xg', 'goal', 'penalty', 'red_card', 'yellow', 'own_goal', 'referee', 'official', 'notes', 'attendance', 'captain', 'manager')
+df = df.drop(columns=[c for c in df.columns if c != TARGET_COL and ('id' in c.lower() or any(t in c.lower() for t in leakage_terms))], errors='ignore')
+X, y = df.drop(columns=[TARGET_COL]), LabelEncoder().fit_transform(df[TARGET_COL].astype(str))
+if 'Year' in df.columns and df['Year'].nunique() >= 2:
+    test_year = df['Year'].max(); train_mask, test_mask = df['Year'] < test_year, df['Year'] == test_year
+else:
+    split_at = max(1, int(len(X) * 0.8)); order = np.arange(len(X)); train_mask, test_mask = order < split_at, order >= split_at
+X = pd.get_dummies(X, dummy_na=True)
+X.columns = [re.sub(r'[\\[\\]<>]', '_', str(c)) for c in X.columns]
+X_train, X_test = X.loc[train_mask].copy(), X.loc[test_mask].copy(); y_train, y_test = y[train_mask], y[test_mask]
+X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
+num_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
+if num_cols:
+    imputer, scaler = SimpleImputer(strategy='median'), StandardScaler()
+    X_train[num_cols] = scaler.fit_transform(imputer.fit_transform(X_train[num_cols])); X_test[num_cols] = scaler.transform(imputer.transform(X_test[num_cols]))
+params['random_state'] = int(os.getenv('RF_SEED', '42'))
+model = build_model(**params); model.fit(X_train, y_train); preds = model.predict(X_test)
+metrics = {{'f1_macro': float(f1_score(y_test, preds, average='macro'))}}
+joblib.dump(model, 'model.joblib')
+with open('metrics.json', 'w', encoding='utf-8') as f:
+    json.dump(metrics, f, indent=2)
+print(metrics)
+"""
         if problem_type == "nlp" or model_name == "DistilBERT":
             return (
                 "import os\n"

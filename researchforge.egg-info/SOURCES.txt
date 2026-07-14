@@ -61,6 +61,7 @@ researchforge/utils/display.py
 researchforge/utils/exporter.py
 researchforge/utils/graph_builder.py
 researchforge/utils/mlflow_tracker.py
+researchforge/utils/pdf_parser.py
 researchforge/utils/state.py
 tests/__init__.py
 tests/conftest.py

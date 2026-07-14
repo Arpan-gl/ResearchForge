@@ -14,9 +14,11 @@ import requests
 import json
 import os
 import re
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from researchforge.config.settings import Settings
+from researchforge.agents.planner.llm import LLMRouter
 
 
 class V1Research:
@@ -33,6 +35,8 @@ class V1Research:
         self.github_token = self.settings.github_token
         self.hf_token = self.settings.huggingface_token
         self.multi_source = self.settings.enable_multi_source
+        self.llm_router = LLMRouter(self.settings)
+        self._research_llm_error = ""
 
     def run(self, topic: str) -> dict:
         queries = self._rewrite_queries(topic)
@@ -49,6 +53,16 @@ class V1Research:
         results = self._filter_relevance(results, topic)
         ranked = self._rerank(results)
         top_sources = ranked[:10]
+        retrieved_at = datetime.now(timezone.utc).isoformat()
+        for source in top_sources:
+            source.setdefault(
+                "provenance",
+                {
+                    "source": source.get("url", "unknown"),
+                    "retrieved_at": retrieved_at,
+                    "agent": "research",
+                },
+            )
 
         # Step 4: extract and compose
         extracted = self._extract(top_sources, topic)
@@ -65,6 +79,11 @@ class V1Research:
         numeric_contradictions = self._detect_contradictions(findings)
         semantic_contradictions = self._detect_semantic_contradictions(findings)
         findings["contradictions"] = numeric_contradictions + semantic_contradictions
+        findings["provenance"] = {
+            "source": "research:multi-source",
+            "retrieved_at": retrieved_at,
+            "agent": "research",
+        }
         return findings
 
     # ──────────────────────────────────────────────────────────────
@@ -80,6 +99,14 @@ class V1Research:
         queries = self._safe_json(self._ask_llm(prompt), fallback=[])
         if isinstance(queries, list) and len(queries) >= 4:
             return queries[:4]
+        lowered = topic.lower()
+        if "ipl" in lowered or "indian premier league" in lowered or "cricket" in lowered:
+            return [
+                "IPL cricket match winner prediction",
+                "Indian Premier League match outcome prediction",
+                "IPL match results dataset benchmark",
+                "cricket match outcome prediction academic paper",
+            ]
         return [
             topic,
             f"{topic} benchmark",
@@ -139,17 +166,29 @@ class V1Research:
 
     def _search_arxiv(self, query: str, max_results: int = 4) -> list:
         try:
-            import arxiv
-            search = arxiv.Search(query=query, max_results=max_results, sort_by=arxiv.SortCriterion.Relevance)
-            client = arxiv.Client()
+            response = requests.get(
+                "https://export.arxiv.org/api/query",
+                params={
+                    "search_query": f"all:{query}",
+                    "start": 0,
+                    "max_results": max_results,
+                    "sortBy": "relevance",
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            root = ET.fromstring(response.text)
+            namespace = {"atom": "http://www.w3.org/2005/Atom"}
             results = []
-            for res in client.results(search):
+            for entry in root.findall("atom:entry", namespace):
+                get_text = lambda name: (entry.findtext(f"atom:{name}", default="", namespaces=namespace) or "").strip()
+                published = get_text("published")
                 results.append({
-                    "title": res.title,
-                    "url": res.entry_id,
-                    "snippet": (res.summary or "")[:800],
+                    "title": get_text("title"),
+                    "url": get_text("id"),
+                    "snippet": get_text("summary")[:800],
                     "source": "arxiv",
-                    "published": res.published.date().isoformat() if res.published else None,
+                    "published": published[:10] if published else None,
                 })
             return results
         except Exception:
@@ -243,7 +282,7 @@ class V1Research:
             overlap = sum(1 for w in topic_words if w in text)
             if overlap >= 2:
                 filtered.append(r)
-        return filtered or results
+        return filtered
 
     def _rerank(self, results: list) -> list:
         """Score = 0.4*depth + 0.3*credibility + 0.3*recency"""
@@ -313,7 +352,10 @@ class V1Research:
             "}\n\n"
             "Return ONLY valid JSON."
         )
-        return self._safe_json(self._ask_llm(prompt), fallback={})
+        parsed = self._safe_json(self._ask_llm(prompt), fallback={})
+        if isinstance(parsed, dict) and parsed.get("key_findings"):
+            return parsed
+        return self._deterministic_extraction(topic, sources)
 
     def _extract_research_blueprint(self, topic: str, sources: list) -> dict:
         if not sources:
@@ -339,7 +381,50 @@ class V1Research:
             "}\n\n"
             "Return ONLY valid JSON."
         )
-        return self._safe_json(self._ask_llm(prompt), fallback={})
+        parsed = self._safe_json(self._ask_llm(prompt), fallback={})
+        if parsed:
+            return parsed
+        return {
+            "problem_definition": topic,
+            "datasets_used": [],
+            "architectures": [],
+            "metrics": [],
+            "limitations": [self._research_llm_error] if self._research_llm_error else [],
+            "contradictions": [],
+            "future_work": [],
+            "reproducibility_score": 0.0,
+        }
+
+    def _deterministic_extraction(self, topic: str, sources: list) -> dict:
+        """Keep retrieved evidence usable when the summarizer is unavailable."""
+        findings = []
+        for index, source in enumerate(sources[:5], start=1):
+            title = (source.get("title") or "Untitled source").strip()
+            snippet = " ".join((source.get("snippet") or "").split())
+            if snippet:
+                snippet = snippet[:300]
+                findings.append(f"[{index}] {title}: {snippet}")
+            else:
+                findings.append(f"[{index}] Retrieved source: {title}")
+
+        lowered = topic.lower()
+        if any(token in lowered for token in ("winner", "classify", "classification", "detect")):
+            problem_type = "classification"
+        elif any(token in lowered for token in ("forecast", "predict", "regression")):
+            problem_type = "regression"
+        else:
+            problem_type = "unknown"
+
+        return {
+            "key_findings": findings,
+            "metrics": [],
+            "limitations": [
+                "LLM evidence synthesis was unavailable; findings above are direct retrieved excerpts."
+            ] if getattr(self, "_research_llm_error", "") else [],
+            "datasets": [],
+            "recommended_models": [],
+            "problem_type": problem_type,
+        }
 
     def _compose(self, topic: str, extracted: dict, sources: list) -> dict:
         findings = extracted.get("key_findings", [])
@@ -475,16 +560,15 @@ class V1Research:
             return []
 
     def _ask_llm(self, prompt: str) -> str:
-        """Send prompt to Ollama — the user's local LLM."""
+        """Use Gemini for research queries, summaries, and evidence reasoning."""
+        if self._research_llm_error:
+            return json.dumps({"error": self._research_llm_error})
         try:
-            resp = requests.post(
-                f"{self.ollama_url}/api/generate",
-                json={"model": self.model, "prompt": prompt, "stream": False},
-                timeout=60
-            )
-            return resp.json().get("response", "")
-        except Exception as e:
-            return f'{{"error": "Ollama not reachable: {str(e)}"}}'
+            response, _provider = self.llm_router.generate_research(prompt)
+            return response
+        except Exception as exc:
+            self._research_llm_error = str(exc)
+            return json.dumps({"error": str(exc)})
 
     def _deduplicate(self, results: list) -> list:
         seen = set()

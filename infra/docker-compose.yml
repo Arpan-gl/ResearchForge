@@ -1,12 +1,12 @@
 ﻿services:
-  ollama:
-    image: ollama/ollama:latest
-    container_name: researchforge-ollama
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    restart: unless-stopped
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: researchforge-ollama
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ollama_data:/root/.ollama
+  #   restart: unless-stopped
 
   postgres:
     image: postgres:16-alpine
@@ -42,8 +42,29 @@
       - redis_data:/data
     restart: unless-stopped
 
+  mlflow:
+    build:
+      context: .
+      dockerfile: mlflow.Dockerfile
+    image: researchforge-mlflow:local
+    container_name: researchforge-mlflow
+    command: >-
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri postgresql://researchforge:researchforge@postgres:5432/researchforge
+      --default-artifact-root /mlartifacts
+    ports:
+      - "5000:5000"
+    depends_on:
+      - postgres
+    volumes:
+      - mlflow_artifacts:/mlartifacts
+    restart: unless-stopped
+
 volumes:
-  ollama_data:
+  # ollama_data:
   postgres_data:
   neo4j_data:
   redis_data:
+  mlflow_artifacts:

@@ -100,7 +100,7 @@ def test_v3_creates_notebook_file():
 
 
 def test_v3_notebook_has_correct_structure():
-    """Generated notebook should have a title + 7 code sections."""
+    """Generated notebook should have a title + 8 code sections."""
     import nbformat
     from researchforge.stages.v3_notebook import V3Notebook
 
@@ -117,11 +117,11 @@ def test_v3_notebook_has_correct_structure():
             )
             with open(result["notebook_path"]) as f:
                 nb = nbformat.read(f, as_version=4)
-            # 1 markdown title + 7 code sections = 8 cells
-            assert len(nb.cells) == 8
+                # 1 markdown title + 8 code sections, including future predictions.
+                assert len(nb.cells) == 9
             assert nb.cells[0].cell_type == "markdown"
             code_cells = [c for c in nb.cells if c.cell_type == "code"]
-            assert len(code_cells) == 7
+            assert len(code_cells) == 8
         finally:
             os.chdir(original_dir)
 

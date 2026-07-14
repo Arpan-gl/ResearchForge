@@ -1,4 +1,4 @@
-﻿"""
+"""
 Settings and init flow for ResearchForge.
 """
 
@@ -12,6 +12,8 @@ import requests
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_LLM_MODEL = "qwen/qwen3-coder-next"
+DEFAULT_RESEARCH_MODEL = "google/gemini-2.5-flash-lite"
+DEFAULT_OPENROUTER_FREE_MODEL = "openrouter/free"
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_POSTGRES_URL = "postgresql://researchforge:researchforge@localhost:5432/researchforge"
 DEFAULT_GRAPH_URL = "bolt://neo4j:researchforge@localhost:7687"
@@ -59,6 +61,29 @@ class Settings:
         )
 
     @property
+    def research_model(self) -> str:
+        return os.environ.get("RF_RESEARCH_MODEL") or self._config.get("research_model") or DEFAULT_RESEARCH_MODEL
+
+    @property
+    def openrouter_free_model(self) -> str:
+        return os.environ.get("RF_OPENROUTER_FREE_MODEL") or self._config.get("openrouter_free_model") or DEFAULT_OPENROUTER_FREE_MODEL
+
+    @property
+    def semantic_scholar_key(self) -> str:
+        return os.environ.get("SEMANTIC_SCHOLAR_API_KEY") or self._config.get("semantic_scholar_key", "")
+
+    @property
+    def github_token(self) -> str:
+        return os.environ.get("GITHUB_TOKEN") or self._config.get("github_token", "")
+
+    @property
+    def enable_multi_source(self) -> bool:
+        value = os.environ.get("RF_ENABLE_MULTI_SOURCE")
+        if value is None:
+            value = self._config.get("enable_multi_source", True)
+        return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+    @property
     def postgres_url(self) -> str:
         return os.environ.get("POSTGRES_URL") or self._config.get("postgres_url") or ""
 
@@ -80,7 +105,7 @@ class Settings:
 
     @property
     def mlflow_tracking_uri(self) -> str:
-        return os.environ.get("MLFLOW_TRACKING_URI") or self._config.get("mlflow_tracking_uri") or "mlruns"
+        return os.environ.get("MLFLOW_TRACKING_URI") or self._config.get("mlflow_tracking_uri") or "http://localhost:5000"
 
     @property
     def tavily_api_key(self) -> str:
@@ -108,6 +133,11 @@ class Settings:
     def _prompt_value(label: str, default: str = "") -> str:
         suffix = f" [{default}]" if default else ""
         return input(f"  {label}{suffix}: ").strip() or default
+
+    @staticmethod
+    def _prompt_secret(label: str, default: str = "") -> str:
+        suffix = " [configured]" if default else ""
+        return input(f"  {label}{suffix} (paste allowed): ").strip() or default
 
     @staticmethod
     def _looks_like_connection_detail(value: str) -> bool:
@@ -164,43 +194,120 @@ class Settings:
         postgres_url = existing.get("postgres_url", "")
         graph_url = existing.get("graph_url", "")
         redis_url = existing.get("redis_url", "")
+        llm_provider = existing.get("llm_provider", "auto")
+        model = existing.get("model", DEFAULT_LLM_MODEL)
+        openrouter_api_key = existing.get("openrouter_api_key", "")
+        openrouter_base_url = existing.get("openrouter_base_url", DEFAULT_OPENROUTER_BASE_URL)
+        research_model = existing.get("research_model", DEFAULT_RESEARCH_MODEL)
+        kaggle_user = existing.get("kaggle_username", "")
+        kaggle_key = existing.get("kaggle_key", "")
+        tavily_key = existing.get("tavily_api_key", "")
+        semantic_scholar_key = existing.get("semantic_scholar_key", "")
+        github_token = existing.get("github_token", "")
+        huggingface_token = existing.get("huggingface_token", "")
+        openai_key = existing.get("openai_api_key", "")
+        mlflow_uri = existing.get("mlflow_tracking_uri", "http://localhost:5000")
+        enable_multi_source = existing.get("enable_multi_source", True)
 
+        if not ollama_reachable:
+            print("\n  Ollama isn't running locally. Choose storage setup:")
+            print("  [a] I'll provide connection strings now")
+            print("  [b] Spin them up for me via Docker Compose")
+            storage_choice = cls._prompt_value("Storage choice", storage_mode[:1] or "a").lower()
+            while storage_choice not in {"a", "b"}:
+                print("  Enter 'a' for manual connection strings or 'b' for Docker Compose.")
+                storage_choice = cls._prompt_value("Storage choice", "a").lower()
+
+            if storage_choice == "a":
+                storage_mode = "manual"
+                postgres_url = cls._require_connection_detail("Postgres URL", postgres_url)
+                graph_url = cls._require_connection_detail("Graph URL or KuzuDB path", graph_url)
+                redis_url = cls._require_connection_detail("Redis URL", redis_url)
+            else:
+                storage_mode = "docker"
+                compose_path = Path.cwd() / "infra" / "docker-compose.yml"
+                cls._run_compose_stack(compose_path)
+                postgres_url = DEFAULT_POSTGRES_URL
+                graph_url = DEFAULT_GRAPH_URL
+                redis_url = DEFAULT_REDIS_URL
+
+            cls._write_runtime_env(
+                settings.runtime_env_path,
+                {
+                    "POSTGRES_URL": postgres_url,
+                    "GRAPH_URL": graph_url,
+                    "REDIS_URL": redis_url,
+                },
+            )
+
+        llm_provider = cls._prompt_value("LLM provider", llm_provider)
+        model = cls._prompt_value("Default model", model)
+        if llm_provider in {"auto", "openrouter"}:
+            openrouter_api_key = cls._prompt_secret("OpenRouter API key", openrouter_api_key)
+            openrouter_base_url = cls._prompt_value("OpenRouter base URL", openrouter_base_url)
+        research_model = cls._prompt_value("Research model via OpenRouter", research_model)
+
+        print("\n  Optional integrations (press Enter to keep current value or skip):")
+        kaggle_user = cls._prompt_value("Kaggle username", kaggle_user)
         if kaggle_user:
-            kaggle_key = input(
-                f"  Kaggle API key [{existing.get('kaggle_key', '')}]: "
-            ).strip() or existing.get("kaggle_key", "")
+            kaggle_key = cls._prompt_secret("Kaggle API key", kaggle_key)
         else:
             kaggle_key = ""
-
-        mlflow_uri = input(
-            f"  MLflow tracking URI [{existing.get('mlflow_tracking_uri', 'mlruns')}]: "
-        ).strip() or existing.get("mlflow_tracking_uri", "mlruns")
-
-        print("\n  Optional API integrations (press Enter to skip):")
-
-        tavily_key = input(
-            f"  Tavily API key [{existing.get('tavily_api_key', '')}]: "
-        ).strip() or existing.get("tavily_api_key", "")
-
-        hf_token = input(
-            f"  Hugging Face token [{existing.get('huggingface_token', '')}]: "
-        ).strip() or existing.get("huggingface_token", "")
-
-        openai_key = input(
-            f"  OpenAI API key [{existing.get('openai_api_key', '')}]: "
-        ).strip() or existing.get("openai_api_key", "")
+        tavily_key = cls._prompt_secret("Tavily API key", tavily_key)
+        semantic_scholar_key = cls._prompt_secret("Semantic Scholar API key", semantic_scholar_key)
+        github_token = cls._prompt_secret("GitHub token", github_token)
+        huggingface_token = cls._prompt_secret("Hugging Face token", huggingface_token)
+        openai_key = cls._prompt_secret("OpenAI API key", openai_key)
+        mlflow_uri = cls._prompt_value("MLflow tracking URI", mlflow_uri)
+        multi_source_default = "yes" if enable_multi_source else "no"
+        multi_source_value = cls._prompt_value("Enable multi-source research (yes/no)", multi_source_default).lower()
+        while multi_source_value not in {"yes", "no", "y", "n"}:
+            print("  Enter yes or no.")
+            multi_source_value = cls._prompt_value("Enable multi-source research (yes/no)", multi_source_default).lower()
+        enable_multi_source = multi_source_value in {"yes", "y"}
 
         config = {
             "ollama_url": ollama_url,
+            "storage_mode": storage_mode,
+            "postgres_url": postgres_url,
+            "graph_url": graph_url,
+            "redis_url": redis_url,
             "llm_provider": llm_provider,
             "model": model,
+            "openrouter_api_key": openrouter_api_key,
+            "openrouter_base_url": openrouter_base_url,
+            "research_model": research_model,
             "kaggle_username": kaggle_user,
             "kaggle_key": kaggle_key,
-            "mlflow_tracking_uri": mlflow_uri,
             "tavily_api_key": tavily_key,
-            "huggingface_token": hf_token,
+            "semantic_scholar_key": semantic_scholar_key,
+            "github_token": github_token,
+            "huggingface_token": huggingface_token,
             "openai_api_key": openai_key,
+            "mlflow_tracking_uri": mlflow_uri,
+            "enable_multi_source": enable_multi_source,
         }
+
+        cls._write_runtime_env(
+            settings.runtime_env_path,
+            {
+                "POSTGRES_URL": postgres_url,
+                "GRAPH_URL": graph_url,
+                "REDIS_URL": redis_url,
+                "OPENROUTER_API_KEY": openrouter_api_key,
+                "OPENROUTER_BASE_URL": openrouter_base_url,
+                "RF_RESEARCH_MODEL": research_model,
+                "KAGGLE_USERNAME": kaggle_user,
+                "KAGGLE_KEY": kaggle_key,
+                "TAVILY_API_KEY": tavily_key,
+                "SEMANTIC_SCHOLAR_API_KEY": semantic_scholar_key,
+                "GITHUB_TOKEN": github_token,
+                "HUGGINGFACE_TOKEN": huggingface_token,
+                "OPENAI_API_KEY": openai_key,
+                "MLFLOW_TRACKING_URI": mlflow_uri,
+                "RF_ENABLE_MULTI_SOURCE": "true" if enable_multi_source else "false",
+            },
+        )
 
         with open(settings.config_path, "w", encoding="utf-8") as handle:
             json.dump(config, handle, indent=2)

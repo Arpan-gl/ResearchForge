@@ -91,22 +91,51 @@ def test_llm_router_falls_back_to_openrouter_when_ollama_is_down():
     )
     router = LLMRouter(settings)
 
-    def fake_post(url, **kwargs):
-        response = SimpleNamespace()
-        response.raise_for_status = lambda: None
-        if url.endswith("/chat/completions"):
-            response.json = lambda: {
-                "choices": [{"message": {"content": json.dumps({"ok": True})}}]
-            }
-            return response
-        raise AssertionError("Unexpected Ollama POST call")
-
     with patch("researchforge.agents.planner.llm.requests.get", side_effect=RuntimeError("down")):
-        with patch("researchforge.agents.planner.llm.requests.post", side_effect=fake_post):
+        with patch.object(LLMRouter, "_call_openrouter", return_value=json.dumps({"ok": True})) as call:
             payload, provider = router.parse_json("prompt")
 
     assert payload == {"ok": True}
     assert provider == "openrouter"
+    call.assert_called_once_with("prompt")
+
+
+def test_llm_router_uses_gemini_for_research_without_checking_ollama():
+    settings = SimpleNamespace(
+        llm_provider="auto",
+        ollama_url="http://localhost:11434",
+        llm_model="qwen/qwen3-coder-next",
+        openrouter_api_key="key",
+        openrouter_base_url="https://openrouter.ai/api/v1",
+        research_model="google/gemini-2.5-flash-lite",
+    )
+    router = LLMRouter(settings)
+
+    with patch.object(router, "_call_openrouter", return_value="research result") as call:
+        result, provider = router.generate_research("summarize retrieved evidence")
+
+    assert result == "research result"
+    assert provider == "openrouter:gemini"
+    call.assert_called_once_with("summarize retrieved evidence", model="google/gemini-2.5-flash-lite")
+
+
+def test_llm_router_uses_free_openrouter_model_after_billing_error():
+    settings = SimpleNamespace(
+        openrouter_api_key="key",
+        research_model="google/gemini-2.5-flash-lite",
+        openrouter_free_model="openrouter/free",
+    )
+    router = LLMRouter(settings)
+    with patch.object(
+        router,
+        "_call_openrouter",
+        side_effect=[RuntimeError("402 Payment Required"), "free result"],
+    ) as call:
+        result, provider = router.generate_research("summarize retrieved evidence")
+
+    assert result == "free result"
+    assert provider == "openrouter:free"
+    assert call.call_args_list[1].kwargs["model"] == "openrouter/free"
 
 
 def test_cli_plan_command_writes_intent_file():
